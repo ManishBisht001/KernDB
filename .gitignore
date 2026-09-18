@@ -1,0 +1,23 @@
+# CMake build output
+/build/
+/out/
+/cmake-build-*/
+
+# Test and coverage artifacts
+/Testing/
+/coverage/
+*.gcda
+*.gcno
+*.profraw
+*.profdata
+
+# IDE and editor files
+/.vs/
+/.vscode/
+*.user
+*.suo
+*.vcxproj.user
+
+# OS files
+.DS_Store
+Thumbs.db
