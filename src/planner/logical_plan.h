@@ -14,6 +14,12 @@ struct LogicalCreateTable {
     Schema schema;
 };
 
+struct LogicalCreateIndex {
+    std::string index_name;
+    TableId table_id;
+    std::size_t column_index;
+};
+
 struct LogicalInsert {
     TableId table_id;
     std::vector<Value> values;
@@ -25,6 +31,6 @@ struct LogicalSelect {
     std::optional<binder::BoundPredicate> predicate;
 };
 
-using LogicalPlan = std::variant<LogicalCreateTable, LogicalInsert, LogicalSelect>;
+using LogicalPlan = std::variant<LogicalCreateTable, LogicalCreateIndex, LogicalInsert, LogicalSelect>;
 
 }  // namespace kerndb::planner

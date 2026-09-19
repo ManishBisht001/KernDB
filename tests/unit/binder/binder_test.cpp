@@ -36,6 +36,25 @@ KERNDB_TEST(BinderResolvesCaseInsensitiveTablesAndColumns) {
     KERNDB_EXPECT(select.predicate.has_value());
 }
 
+KERNDB_TEST(BinderResolvesCreateIndexAndRestrictsItToIntColumns) {
+    kerndb::InMemoryCatalog catalog = MakeCatalog();
+    const auto create_index = kerndb::parser::ParseSql(
+        "CREATE INDEX PEOPLE_ID_IDX ON people(ID)");
+    KERNDB_EXPECT(create_index.ok());
+    const auto bound = kerndb::binder::BindStatement(create_index.value(), catalog);
+    KERNDB_EXPECT(bound.ok());
+    const auto& index = std::get<kerndb::binder::BoundCreateIndex>(bound.value());
+    KERNDB_EXPECT_EQ(std::string("people_id_idx"), index.index_name);
+    KERNDB_EXPECT_EQ(std::size_t{0U}, index.column_index);
+
+    const auto text_index = kerndb::parser::ParseSql(
+        "CREATE INDEX people_name_idx ON people(name)");
+    KERNDB_EXPECT(text_index.ok());
+    const auto rejected = kerndb::binder::BindStatement(text_index.value(), catalog);
+    KERNDB_EXPECT(!rejected.ok());
+    KERNDB_EXPECT_EQ(kerndb::ErrorCode::kBinding, rejected.status().code());
+}
+
 KERNDB_TEST(BinderRejectsDuplicateColumnsAndInvalidDataReferences) {
     kerndb::InMemoryCatalog catalog = MakeCatalog();
 

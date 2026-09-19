@@ -14,6 +14,12 @@ struct PhysicalCreateTable {
     Schema schema;
 };
 
+struct PhysicalCreateIndex {
+    std::string index_name;
+    TableId table_id;
+    std::size_t column_index;
+};
+
 struct PhysicalInsert {
     TableId table_id;
     std::vector<Value> values;
@@ -25,6 +31,17 @@ struct PhysicalSequentialScan {
     std::optional<binder::BoundPredicate> predicate;
 };
 
-using PhysicalPlan = std::variant<PhysicalCreateTable, PhysicalInsert, PhysicalSequentialScan>;
+struct PhysicalIndexScan {
+    TableId table_id;
+    std::vector<std::size_t> projection_indices;
+    binder::BoundPredicate predicate;
+};
+
+using PhysicalPlan = std::variant<
+    PhysicalCreateTable,
+    PhysicalCreateIndex,
+    PhysicalInsert,
+    PhysicalSequentialScan,
+    PhysicalIndexScan>;
 
 }  // namespace kerndb::planner

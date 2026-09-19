@@ -7,7 +7,7 @@
 #include "planner/planner.h"
 #include "test_framework.h"
 
-KERNDB_TEST(PlannerAlwaysLowersSelectToASequentialScan) {
+KERNDB_TEST(PlannerLowersIntEqualityToAnIndexScanCandidate) {
     kerndb::InMemoryCatalog catalog;
     const kerndb::Schema schema{
         kerndb::ColumnDefinition{.name = "id", .type = kerndb::ColumnType::kInt},
@@ -21,6 +21,24 @@ KERNDB_TEST(PlannerAlwaysLowersSelectToASequentialScan) {
 
     const kerndb::planner::LogicalPlan logical = kerndb::planner::BuildLogicalPlan(bound.value());
     KERNDB_EXPECT(std::holds_alternative<kerndb::planner::LogicalSelect>(logical));
+    const auto physical = kerndb::planner::PlanStatement(bound.value());
+    KERNDB_EXPECT(physical.ok());
+    KERNDB_EXPECT(std::holds_alternative<kerndb::planner::PhysicalIndexScan>(
+        physical.value()));
+}
+
+KERNDB_TEST(PlannerKeepsNonIntPredicatesAsSequentialScans) {
+    kerndb::InMemoryCatalog catalog;
+    const kerndb::Schema schema{
+        kerndb::ColumnDefinition{.name = "id", .type = kerndb::ColumnType::kInt},
+        kerndb::ColumnDefinition{.name = "name", .type = kerndb::ColumnType::kText},
+    };
+    KERNDB_EXPECT(catalog.CreateTable("people", schema).ok());
+
+    const auto ast = kerndb::parser::ParseSql("SELECT id FROM people WHERE name = 'Ada'");
+    KERNDB_EXPECT(ast.ok());
+    const auto bound = kerndb::binder::BindStatement(ast.value(), catalog);
+    KERNDB_EXPECT(bound.ok());
     const auto physical = kerndb::planner::PlanStatement(bound.value());
     KERNDB_EXPECT(physical.ok());
     KERNDB_EXPECT(std::holds_alternative<kerndb::planner::PhysicalSequentialScan>(

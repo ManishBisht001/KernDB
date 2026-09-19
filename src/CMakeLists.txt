@@ -9,11 +9,13 @@ add_library(kerndb STATIC
     parser/lexer.cpp
     parser/parser.cpp
     planner/planner.cpp
+    storage/bplus_tree.cpp
     storage/buffer_pool.cpp
     storage/catalog_store.cpp
     storage/database_metadata.cpp
     storage/disk_manager.cpp
     storage/heap.cpp
+    storage/index_catalog_store.cpp
     storage/page.cpp
     storage/page_manager.cpp
     storage/persistent_storage.cpp

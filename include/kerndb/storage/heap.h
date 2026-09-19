@@ -43,6 +43,8 @@ public:
     [[nodiscard]] Result<RecordId> Insert(const Schema& schema, const Tuple& tuple);
     [[nodiscard]] Result<Tuple> Read(const Schema& schema, RecordId record_id) const;
     [[nodiscard]] Result<std::vector<Tuple>> Scan(const Schema& schema) const;
+    [[nodiscard]] Result<std::vector<std::pair<RecordId, Tuple>>> ScanWithRecordIds(
+        const Schema& schema) const;
 
 private:
     PageManager& page_manager_;

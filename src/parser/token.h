@@ -34,6 +34,8 @@ enum class TokenKind {
     kMinus,
     kCreate,
     kTable,
+    kIndex,
+    kOn,
     kInsert,
     kInto,
     kValues,

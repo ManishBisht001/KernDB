@@ -6,10 +6,18 @@
 #include "parser/parser.h"
 #include "test_framework.h"
 
-KERNDB_TEST(ParserBuildsAllPhaseOneStatementKinds) {
+KERNDB_TEST(ParserBuildsAllSupportedStatementKinds) {
     const auto create = kerndb::parser::ParseSql("CREATE TABLE People (id INT, name TEXT);");
     KERNDB_EXPECT(create.ok());
     KERNDB_EXPECT(std::holds_alternative<kerndb::parser::AstCreateTable>(create.value()));
+
+    const auto create_index = kerndb::parser::ParseSql(
+        "CREATE INDEX people_id_idx ON people(id);");
+    KERNDB_EXPECT(create_index.ok());
+    const auto& index_statement = std::get<kerndb::parser::AstCreateIndex>(create_index.value());
+    KERNDB_EXPECT_EQ(std::string("people_id_idx"), index_statement.index_name.text);
+    KERNDB_EXPECT_EQ(std::string("people"), index_statement.table_name.text);
+    KERNDB_EXPECT_EQ(std::string("id"), index_statement.column_name.text);
 
     const auto insert = kerndb::parser::ParseSql("INSERT INTO people VALUES (-1, 'Ada''s')");
     KERNDB_EXPECT(insert.ok());

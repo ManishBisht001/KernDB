@@ -15,6 +15,12 @@ LogicalPlan BuildLogicalPlan(const binder::BoundStatement& statement) {
                     .table_name = bound_statement.table_name,
                     .schema = bound_statement.schema,
                 };
+            } else if constexpr (std::is_same_v<StatementType, binder::BoundCreateIndex>) {
+                return LogicalCreateIndex{
+                    .index_name = bound_statement.index_name,
+                    .table_id = bound_statement.table_id,
+                    .column_index = bound_statement.column_index,
+                };
             } else if constexpr (std::is_same_v<StatementType, binder::BoundInsert>) {
                 return LogicalInsert{
                     .table_id = bound_statement.table_id,
@@ -40,10 +46,23 @@ PhysicalPlan BuildPhysicalPlan(const LogicalPlan& plan) {
                     .table_name = logical_plan.table_name,
                     .schema = logical_plan.schema,
                 };
+            } else if constexpr (std::is_same_v<PlanType, LogicalCreateIndex>) {
+                return PhysicalCreateIndex{
+                    .index_name = logical_plan.index_name,
+                    .table_id = logical_plan.table_id,
+                    .column_index = logical_plan.column_index,
+                };
             } else if constexpr (std::is_same_v<PlanType, LogicalInsert>) {
                 return PhysicalInsert{
                     .table_id = logical_plan.table_id,
                     .values = logical_plan.values,
+                };
+            } else if (logical_plan.predicate.has_value() &&
+                       std::holds_alternative<std::int64_t>(logical_plan.predicate->literal)) {
+                return PhysicalIndexScan{
+                    .table_id = logical_plan.table_id,
+                    .projection_indices = logical_plan.projection_indices,
+                    .predicate = logical_plan.predicate.value(),
                 };
             } else {
                 return PhysicalSequentialScan{

@@ -60,6 +60,27 @@ namespace {
     }};
 }
 
+[[nodiscard]] Result<BoundStatement> BindCreateIndex(
+    const parser::AstCreateIndex& statement,
+    const InMemoryCatalog& catalog) {
+    const auto table = ResolveTable(statement.table_name, catalog);
+    if (!table.ok()) {
+        return table.status();
+    }
+    const auto column_index = ResolveColumn(statement.column_name, *table.value());
+    if (!column_index.ok()) {
+        return column_index.status();
+    }
+    if (table.value()->schema[column_index.value()].type != ColumnType::kInt) {
+        return BindingError(statement.column_name.span, "Phase 4 indexes support INT columns only");
+    }
+    return BoundStatement{BoundCreateIndex{
+        .index_name = NormalizeIdentifier(statement.index_name.text),
+        .table_id = table.value()->id,
+        .column_index = column_index.value(),
+    }};
+}
+
 [[nodiscard]] Result<BoundStatement> BindInsert(
     const parser::AstInsert& statement,
     const InMemoryCatalog& catalog) {
@@ -157,6 +178,8 @@ Result<BoundStatement> BindStatement(
             using StatementType = std::decay_t<decltype(concrete_statement)>;
             if constexpr (std::is_same_v<StatementType, parser::AstCreateTable>) {
                 return BindCreateTable(concrete_statement);
+            } else if constexpr (std::is_same_v<StatementType, parser::AstCreateIndex>) {
+                return BindCreateIndex(concrete_statement, catalog);
             } else if constexpr (std::is_same_v<StatementType, parser::AstInsert>) {
                 return BindInsert(concrete_statement, catalog);
             } else {

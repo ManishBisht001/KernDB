@@ -18,6 +18,7 @@ inline constexpr std::size_t kPageHeaderSize = 40U;
 enum class PageType : std::uint16_t {
     kCatalog = 1U,
     kHeap = 2U,
+    kIndex = 3U,
 };
 
 class Page {

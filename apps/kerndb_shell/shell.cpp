@@ -26,6 +26,9 @@ void PrintResult(const QueryResult& result, std::ostream& output) {
         case QueryResultKind::kCreateTable:
             output << "CREATE TABLE\n";
             return;
+        case QueryResultKind::kCreateIndex:
+            output << "CREATE INDEX\n";
+            return;
         case QueryResultKind::kInsert:
             output << "INSERT " << result.rows_affected << "\n";
             return;

@@ -388,4 +388,39 @@ Result<std::vector<Tuple>> TableHeap::Scan(const Schema& schema) const {
     return tuples;
 }
 
+Result<std::vector<std::pair<RecordId, Tuple>>> TableHeap::ScanWithRecordIds(const Schema& schema) const {
+    const auto page_count = page_manager_.PageCount();
+    if (!page_count.ok()) {
+        return page_count.status();
+    }
+    std::vector<std::pair<RecordId, Tuple>> tuples;
+    for (std::uint64_t raw_page_id = 0U; raw_page_id < page_count.value(); ++raw_page_id) {
+        const PageId page_id{raw_page_id};
+        const auto page = page_manager_.ReadPage(page_id);
+        if (!page.ok()) {
+            return page.status();
+        }
+        if (page.value().type() != PageType::kHeap) {
+            return HeapCorruption("table file contains a non-heap page")
+                .WithContext("page_id", ToString(page_id));
+        }
+        const auto heap_page = SlottedPage::Load(page.value());
+        if (!heap_page.ok()) {
+            return heap_page.status();
+        }
+        const auto records = heap_page.value().Records();
+        if (!records.ok()) {
+            return records.status();
+        }
+        for (const auto& [slot_id, bytes] : records.value()) {
+            const auto tuple = DecodeRecord(schema, bytes);
+            if (!tuple.ok()) {
+                return tuple.status();
+            }
+            tuples.emplace_back(RecordId{.page_id = page_id, .slot_id = slot_id}, tuple.value());
+        }
+    }
+    return tuples;
+}
+
 }  // namespace kerndb::storage

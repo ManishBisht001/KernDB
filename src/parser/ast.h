@@ -31,6 +31,12 @@ struct AstCreateTable {
     std::vector<AstColumnDefinition> columns;
 };
 
+struct AstCreateIndex {
+    AstIdentifier index_name;
+    AstIdentifier table_name;
+    AstIdentifier column_name;
+};
+
 struct AstInsert {
     AstIdentifier table_name;
     std::vector<AstLiteral> values;
@@ -47,6 +53,6 @@ struct AstSelect {
     std::optional<AstPredicate> predicate;
 };
 
-using AstStatement = std::variant<AstCreateTable, AstInsert, AstSelect>;
+using AstStatement = std::variant<AstCreateTable, AstCreateIndex, AstInsert, AstSelect>;
 
 }  // namespace kerndb::parser

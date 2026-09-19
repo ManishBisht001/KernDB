@@ -36,6 +36,12 @@ namespace {
     if (normalized == "table") {
         return TokenKind::kTable;
     }
+    if (normalized == "index") {
+        return TokenKind::kIndex;
+    }
+    if (normalized == "on") {
+        return TokenKind::kOn;
+    }
     if (normalized == "insert") {
         return TokenKind::kInsert;
     }
@@ -261,6 +267,10 @@ std::string_view TokenKindName(TokenKind kind) noexcept {
             return "CREATE";
         case TokenKind::kTable:
             return "TABLE";
+        case TokenKind::kIndex:
+            return "INDEX";
+        case TokenKind::kOn:
+            return "ON";
         case TokenKind::kInsert:
             return "INSERT";
         case TokenKind::kInto:

@@ -119,11 +119,21 @@ private:
 
     [[nodiscard]] Result<AstStatement> ParseStatement() {
         if (Match(TokenKind::kCreate)) {
-            const auto statement = ParseCreateTable();
-            if (!statement.ok()) {
-                return statement.status();
+            if (Match(TokenKind::kTable)) {
+                const auto statement = ParseCreateTable();
+                if (!statement.ok()) {
+                    return statement.status();
+                }
+                return AstStatement{std::move(statement).value()};
             }
-            return AstStatement{std::move(statement).value()};
+            if (Match(TokenKind::kIndex)) {
+                const auto statement = ParseCreateIndex();
+                if (!statement.ok()) {
+                    return statement.status();
+                }
+                return AstStatement{std::move(statement).value()};
+            }
+            return SyntaxError(Current().span, "expected TABLE or INDEX after CREATE");
         }
         if (Match(TokenKind::kInsert)) {
             const auto statement = ParseInsert();
@@ -143,10 +153,6 @@ private:
     }
 
     [[nodiscard]] Result<AstCreateTable> ParseCreateTable() {
-        const auto table_keyword = Expect(TokenKind::kTable, "TABLE after CREATE");
-        if (!table_keyword.ok()) {
-            return table_keyword.status();
-        }
         const auto table_name = ParseIdentifier();
         if (!table_name.ok()) {
             return table_name.status();
@@ -190,6 +196,38 @@ private:
         return AstCreateTable{
             .table_name = table_name.value(),
             .columns = std::move(columns),
+        };
+    }
+
+    [[nodiscard]] Result<AstCreateIndex> ParseCreateIndex() {
+        const auto index_name = ParseIdentifier();
+        if (!index_name.ok()) {
+            return index_name.status();
+        }
+        const auto on = Expect(TokenKind::kOn, "ON after index name");
+        if (!on.ok()) {
+            return on.status();
+        }
+        const auto table_name = ParseIdentifier();
+        if (!table_name.ok()) {
+            return table_name.status();
+        }
+        const auto left_paren = Expect(TokenKind::kLeftParen, "'(' after table name");
+        if (!left_paren.ok()) {
+            return left_paren.status();
+        }
+        const auto column_name = ParseIdentifier();
+        if (!column_name.ok()) {
+            return column_name.status();
+        }
+        const auto right_paren = Expect(TokenKind::kRightParen, "')' after index column");
+        if (!right_paren.ok()) {
+            return right_paren.status();
+        }
+        return AstCreateIndex{
+            .index_name = index_name.value(),
+            .table_name = table_name.value(),
+            .column_name = column_name.value(),
         };
     }
 

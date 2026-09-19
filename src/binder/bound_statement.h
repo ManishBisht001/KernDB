@@ -16,6 +16,12 @@ struct BoundCreateTable {
     Schema schema;
 };
 
+struct BoundCreateIndex {
+    std::string index_name;
+    TableId table_id;
+    std::size_t column_index;
+};
+
 struct BoundInsert {
     TableId table_id;
     std::vector<Value> values;
@@ -32,6 +38,6 @@ struct BoundSelect {
     std::optional<BoundPredicate> predicate;
 };
 
-using BoundStatement = std::variant<BoundCreateTable, BoundInsert, BoundSelect>;
+using BoundStatement = std::variant<BoundCreateTable, BoundCreateIndex, BoundInsert, BoundSelect>;
 
 }  // namespace kerndb::binder

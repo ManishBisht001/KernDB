@@ -12,9 +12,11 @@ add_executable(kerndb_phase2_tests
     unit/planner/planner_test.cpp
     unit/storage/catalog_store_test.cpp
     unit/storage/buffer_pool_test.cpp
+    unit/storage/bplus_tree_test.cpp
     unit/storage/database_metadata_test.cpp
     unit/storage/disk_manager_test.cpp
     unit/storage/heap_test.cpp
+    unit/storage/index_catalog_store_test.cpp
     unit/storage/page_test.cpp
     unit/storage/record_test.cpp
     unit/types/types_test.cpp

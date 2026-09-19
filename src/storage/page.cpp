@@ -183,6 +183,7 @@ Result<PageType> Page::DecodePageType(std::uint16_t raw_type) {
     switch (static_cast<PageType>(raw_type)) {
         case PageType::kCatalog:
         case PageType::kHeap:
+        case PageType::kIndex:
             return static_cast<PageType>(raw_type);
     }
     return Corruption("page type is invalid").WithContext("page_type", std::to_string(raw_type));

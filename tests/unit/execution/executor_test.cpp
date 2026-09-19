@@ -49,3 +49,18 @@ KERNDB_TEST(ExecutorCreatesInsertsFiltersAndProjectsInMemoryRows) {
         std::string("Ada"),
         std::get<std::string>(result.value().rows[0][0]));
 }
+
+KERNDB_TEST(ExecutorAcceptsCreateIndexForTheInMemoryFallback) {
+    kerndb::InMemoryCatalog catalog;
+    KERNDB_EXPECT(Execute(catalog, "CREATE TABLE people (id INT, name TEXT)").ok());
+    KERNDB_EXPECT(Execute(catalog, "INSERT INTO people VALUES (1, 'Ada')").ok());
+
+    const auto create_index = Execute(catalog, "CREATE INDEX people_id_idx ON people(id)");
+    KERNDB_EXPECT(create_index.ok());
+    KERNDB_EXPECT_EQ(kerndb::QueryResultKind::kCreateIndex, create_index.value().kind);
+
+    const auto selected = Execute(catalog, "SELECT name FROM people WHERE id = 1");
+    KERNDB_EXPECT(selected.ok());
+    KERNDB_EXPECT_EQ(std::size_t{1U}, selected.value().rows.size());
+    KERNDB_EXPECT_EQ(std::string("Ada"), std::get<std::string>(selected.value().rows[0][0]));
+}

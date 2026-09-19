@@ -27,6 +27,7 @@ using Tuple = std::vector<Value>;
 
 enum class QueryResultKind : std::uint8_t {
     kCreateTable,
+    kCreateIndex,
     kInsert,
     kSelect,
 };
