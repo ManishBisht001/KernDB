@@ -89,16 +89,17 @@ Result<void> PersistentStorage::CreateTable(const InMemoryTable& table) {
     if (error) {
         return FilesystemError(table_path, "failed to inspect table storage file", error);
     }
-    const auto pages = OpenTablePages(table.id, true);
+    const auto pages = GetTablePages(table.id, true);
     if (!pages.ok()) {
         return pages.status();
     }
-    const Status flush_status = pages.value().Flush();
+    const Status flush_status = pages.value()->Flush();
     if (!flush_status.ok()) {
         return flush_status;
     }
     const Status catalog_status = catalog_store_.Append(table);
     if (!catalog_status.ok()) {
+        table_pages_.erase(table.id.value());
         std::error_code cleanup_error;
         std::filesystem::remove(table_path, cleanup_error);
         return catalog_status;
@@ -107,20 +108,20 @@ Result<void> PersistentStorage::CreateTable(const InMemoryTable& table) {
 }
 
 Result<RecordId> PersistentStorage::Insert(const InMemoryTable& table, const Tuple& tuple) {
-    auto pages = OpenTablePages(table.id, false);
+    const auto pages = GetTablePages(table.id, false);
     if (!pages.ok()) {
         return pages.status();
     }
-    TableHeap heap{pages.value()};
+    TableHeap heap{*pages.value()};
     return heap.Insert(table.schema, tuple);
 }
 
 Result<std::vector<Tuple>> PersistentStorage::Scan(const InMemoryTable& table) const {
-    auto pages = OpenTablePages(table.id, false);
+    const auto pages = GetTablePages(table.id, false);
     if (!pages.ok()) {
         return pages.status();
     }
-    TableHeap heap{pages.value()};
+    TableHeap heap{*pages.value()};
     return heap.Scan(table.schema);
 }
 
@@ -134,10 +135,23 @@ std::filesystem::path PersistentStorage::TablePath(TableId table_id) const {
     return database_directory_ / "tables" / (ToString(table_id) + ".dat");
 }
 
-Result<PageManager> PersistentStorage::OpenTablePages(
+Result<PageManager*> PersistentStorage::GetTablePages(
     TableId table_id,
     bool create_if_missing) const {
-    return PageManager::Open(TablePath(table_id), create_if_missing);
+    const auto existing = table_pages_.find(table_id.value());
+    if (existing != table_pages_.end()) {
+        return existing->second.get();
+    }
+    auto opened = PageManager::Open(TablePath(table_id), create_if_missing);
+    if (!opened.ok()) {
+        return opened.status();
+    }
+    auto page_manager = std::make_unique<PageManager>(std::move(opened).value());
+    const auto [iterator, inserted] = table_pages_.emplace(table_id.value(), std::move(page_manager));
+    if (!inserted) {
+        return Status::Error(ErrorCode::kInternal, "table page manager was inserted concurrently");
+    }
+    return iterator->second.get();
 }
 
 Result<std::unique_ptr<PersistentStorage>> OpenPersistentStorage(

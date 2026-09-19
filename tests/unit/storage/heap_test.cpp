@@ -50,7 +50,7 @@ KERNDB_TEST(SlottedPageUsesTheLastByteOfAnEmptyPageWithoutOverlappingSlots) {
     KERNDB_EXPECT(!no_space.value().has_value());
 }
 
-KERNDB_TEST(TableHeapPersistsAndScansTuplesWithoutABufferPool) {
+KERNDB_TEST(TableHeapPersistsAndScansTuplesThroughTheBufferPool) {
     kerndb::test::TemporaryDirectory directory;
     const std::filesystem::path path = directory.path() / "table.dat";
     const kerndb::Schema schema{

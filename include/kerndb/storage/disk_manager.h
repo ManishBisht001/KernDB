@@ -19,6 +19,10 @@ public:
     [[nodiscard]] Result<std::uint64_t> PageCount() const;
     [[nodiscard]] Result<Page> ReadPage(PageId page_id) const;
     [[nodiscard]] Status WritePage(const Page& page) const;
+    // Phase 3 supports safe physical deletion only for the final page in a
+    // file. Reclaiming arbitrary page IDs needs a durable free-page map and is
+    // deliberately deferred beyond this phase.
+    [[nodiscard]] Status DeletePage(PageId page_id) const;
     [[nodiscard]] Status Flush() const;
     [[nodiscard]] const std::filesystem::path& path() const noexcept;
 

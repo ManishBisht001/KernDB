@@ -9,6 +9,7 @@ add_library(kerndb STATIC
     parser/lexer.cpp
     parser/parser.cpp
     planner/planner.cpp
+    storage/buffer_pool.cpp
     storage/catalog_store.cpp
     storage/database_metadata.cpp
     storage/disk_manager.cpp

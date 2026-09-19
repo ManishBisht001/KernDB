@@ -1,6 +1,9 @@
 #pragma once
 
+#include <cstdint>
 #include <filesystem>
+#include <map>
+#include <memory>
 
 #include "catalog_store.h"
 #include "kerndb/storage/table_storage.h"
@@ -21,10 +24,13 @@ private:
     PersistentStorage(std::filesystem::path database_directory, CatalogStore catalog_store);
 
     [[nodiscard]] std::filesystem::path TablePath(TableId table_id) const;
-    [[nodiscard]] Result<PageManager> OpenTablePages(TableId table_id, bool create_if_missing) const;
+    [[nodiscard]] Result<PageManager*> GetTablePages(
+        TableId table_id,
+        bool create_if_missing) const;
 
     std::filesystem::path database_directory_;
     CatalogStore catalog_store_;
+    mutable std::map<std::uint64_t, std::unique_ptr<PageManager>> table_pages_;
 };
 
 }  // namespace kerndb::storage

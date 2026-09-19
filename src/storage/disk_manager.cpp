@@ -137,6 +137,40 @@ Status DiskManager::WritePage(const Page& page) const {
     return Status::Ok();
 }
 
+Status DiskManager::DeletePage(PageId page_id) const {
+    if (!page_id.valid()) {
+        return Status::Error(ErrorCode::kInvalidArgument, "cannot delete an invalid page ID")
+            .WithContext("path", path_.string());
+    }
+    const auto page_count = PageCount();
+    if (!page_count.ok()) {
+        return page_count.status();
+    }
+    if (page_count.value() == 0U || page_id.value() >= page_count.value()) {
+        return Status::Error(ErrorCode::kOutOfRange, "page does not exist in file")
+            .WithContext("path", path_.string())
+            .WithContext("page_id", ToString(page_id));
+    }
+    if (page_id.value() != page_count.value() - 1U) {
+        return Status::Error(
+                   ErrorCode::kUnsupported,
+                   "only the final page can be deleted without a free-page map")
+            .WithContext("path", path_.string())
+            .WithContext("page_id", ToString(page_id));
+    }
+    std::error_code error;
+    std::filesystem::resize_file(
+        path_,
+        static_cast<std::uintmax_t>(page_id.value()) * kInitialPageSizeBytes,
+        error);
+    if (error) {
+        return IoError(path_, "failed to truncate deleted page")
+            .WithContext("error", error.message())
+            .WithContext("page_id", ToString(page_id));
+    }
+    return Status::Ok();
+}
+
 Status DiskManager::Flush() const {
     const auto size = FileSize();
     if (!size.ok()) {
