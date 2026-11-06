@@ -21,6 +21,8 @@ public:
     [[nodiscard]] Result<std::optional<SlotId>> Insert(std::span<const std::byte> record);
     [[nodiscard]] Result<std::vector<std::byte>> Read(SlotId slot_id) const;
     [[nodiscard]] Result<std::vector<std::pair<SlotId, std::vector<std::byte>>>> Records() const;
+    [[nodiscard]] Status Erase(SlotId slot_id);
+    [[nodiscard]] Status Restore(SlotId slot_id);
     [[nodiscard]] std::size_t FreeBytes() const;
     [[nodiscard]] const Page& page() const noexcept;
 
@@ -42,6 +44,8 @@ public:
 
     [[nodiscard]] Result<RecordId> Insert(const Schema& schema, const Tuple& tuple);
     [[nodiscard]] Result<Tuple> Read(const Schema& schema, RecordId record_id) const;
+    [[nodiscard]] Status Erase(RecordId record_id);
+    [[nodiscard]] Status Restore(RecordId record_id);
     [[nodiscard]] Result<std::vector<Tuple>> Scan(const Schema& schema) const;
     [[nodiscard]] Result<std::vector<std::pair<RecordId, Tuple>>> ScanWithRecordIds(
         const Schema& schema) const;

@@ -31,6 +31,9 @@ target_link_libraries(kerndb_phase2_tests
         kerndb_shell_support
 )
 
+target_compile_definitions(kerndb PRIVATE KERNDB_ENABLE_TEST_HOOKS)
+target_compile_definitions(kerndb_phase2_tests PRIVATE KERNDB_ENABLE_TEST_HOOKS)
+
 target_include_directories(kerndb_phase2_tests
     PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/test_support"

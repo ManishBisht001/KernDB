@@ -137,3 +137,30 @@ KERNDB_TEST(BPlusTreePersistsRootLeavesAndEntriesAcrossReopen) {
     KERNDB_EXPECT(!missing.ok());
     KERNDB_EXPECT_EQ(kerndb::ErrorCode::kNotFound, missing.status().code());
 }
+
+KERNDB_TEST(BPlusTreeRemovesEntriesWithoutInvalidatingRemainingSearches) {
+    kerndb::test::TemporaryDirectory directory;
+    auto manager = kerndb::storage::PageManager::Open(directory.path() / "tree.dat", true, 3U);
+    KERNDB_EXPECT(manager.ok());
+    auto tree = kerndb::storage::BPlusTree::Create(manager.value());
+    KERNDB_EXPECT(tree.ok());
+    for (std::int64_t key = 1; key <= 32; ++key) {
+        KERNDB_EXPECT(tree.value().Insert(key, RecordFor(key)).ok());
+    }
+
+    KERNDB_EXPECT(tree.value().Remove(9, RecordFor(9)).ok());
+    KERNDB_EXPECT(tree.value().Remove(17, RecordFor(17)).ok());
+    KERNDB_EXPECT_EQ(
+        kerndb::ErrorCode::kNotFound,
+        tree.value().Search(9).status().code());
+    KERNDB_EXPECT_EQ(
+        kerndb::ErrorCode::kNotFound,
+        tree.value().Search(17).status().code());
+    KERNDB_EXPECT(tree.value().Search(8).ok());
+    KERNDB_EXPECT(tree.value().Search(10).ok());
+    KERNDB_EXPECT(tree.value().Search(18).ok());
+
+    const auto mismatched_rid = tree.value().Remove(10, RecordFor(11));
+    KERNDB_EXPECT(!mismatched_rid.ok());
+    KERNDB_EXPECT_EQ(kerndb::ErrorCode::kCorruption, mismatched_rid.status().code());
+}

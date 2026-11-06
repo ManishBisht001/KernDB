@@ -31,6 +31,24 @@ struct LogicalSelect {
     std::optional<binder::BoundPredicate> predicate;
 };
 
-using LogicalPlan = std::variant<LogicalCreateTable, LogicalCreateIndex, LogicalInsert, LogicalSelect>;
+struct LogicalUpdate {
+    TableId table_id;
+    std::size_t column_index;
+    Value value;
+    binder::BoundPredicate predicate;
+};
+
+struct LogicalDelete {
+    TableId table_id;
+    binder::BoundPredicate predicate;
+};
+
+using LogicalPlan = std::variant<
+    LogicalCreateTable,
+    LogicalCreateIndex,
+    LogicalInsert,
+    LogicalSelect,
+    LogicalUpdate,
+    LogicalDelete>;
 
 }  // namespace kerndb::planner

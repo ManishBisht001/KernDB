@@ -78,6 +78,29 @@ KERNDB_TEST(TableHeapPersistsAndScansTuplesThroughTheBufferPool) {
     KERNDB_EXPECT_EQ(std::size_t{1U}, scan.value().size());
 }
 
+KERNDB_TEST(TableHeapTombstonesDeletedRecordsAndCanRestoreThemForRollback) {
+    kerndb::test::TemporaryDirectory directory;
+    auto manager = kerndb::storage::PageManager::Open(directory.path() / "table.dat", true);
+    KERNDB_EXPECT(manager.ok());
+    const kerndb::Schema schema{
+        {.name = "id", .type = kerndb::ColumnType::kInt},
+        {.name = "name", .type = kerndb::ColumnType::kText},
+    };
+    kerndb::storage::TableHeap heap{manager.value()};
+    const auto inserted = heap.Insert(schema, kerndb::Tuple{std::int64_t{1}, std::string("Ada")});
+    KERNDB_EXPECT(inserted.ok());
+    KERNDB_EXPECT(heap.Erase(inserted.value()).ok());
+    KERNDB_EXPECT_EQ(kerndb::ErrorCode::kNotFound, heap.Read(schema, inserted.value()).status().code());
+    const auto after_delete = heap.Scan(schema);
+    KERNDB_EXPECT(after_delete.ok());
+    KERNDB_EXPECT_EQ(std::size_t{0U}, after_delete.value().size());
+
+    KERNDB_EXPECT(heap.Restore(inserted.value()).ok());
+    const auto restored = heap.Read(schema, inserted.value());
+    KERNDB_EXPECT(restored.ok());
+    KERNDB_EXPECT_EQ(std::string("Ada"), std::get<std::string>(restored.value()[1]));
+}
+
 KERNDB_TEST(PageManagerAllocatesContiguousPersistentPageIds) {
     kerndb::test::TemporaryDirectory directory;
     const std::filesystem::path path = directory.path() / "pages.dat";

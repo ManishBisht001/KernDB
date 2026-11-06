@@ -32,6 +32,21 @@ void PrintResult(const QueryResult& result, std::ostream& output) {
         case QueryResultKind::kInsert:
             output << "INSERT " << result.rows_affected << "\n";
             return;
+        case QueryResultKind::kUpdate:
+            output << "UPDATE " << result.rows_affected << "\n";
+            return;
+        case QueryResultKind::kDelete:
+            output << "DELETE " << result.rows_affected << "\n";
+            return;
+        case QueryResultKind::kBegin:
+            output << "BEGIN\n";
+            return;
+        case QueryResultKind::kCommit:
+            output << "COMMIT\n";
+            return;
+        case QueryResultKind::kRollback:
+            output << "ROLLBACK\n";
+            return;
         case QueryResultKind::kSelect:
             break;
     }

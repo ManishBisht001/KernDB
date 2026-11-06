@@ -32,6 +32,7 @@ public:
     [[nodiscard]] static Result<BPlusTree> Open(PageManager& page_manager, PageId root_page_id);
 
     [[nodiscard]] Result<void> Insert(std::int64_t key, RecordId record_id);
+    [[nodiscard]] Result<void> Remove(std::int64_t key, RecordId record_id);
     [[nodiscard]] Result<RecordId> Search(std::int64_t key) const;
     [[nodiscard]] Result<std::vector<BPlusTreeEntry>> ScanAll() const;
     [[nodiscard]] PageId root_page_id() const noexcept;

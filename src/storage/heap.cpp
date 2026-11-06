@@ -18,6 +18,7 @@ constexpr std::size_t kHeapHeaderSize = 8U;
 constexpr std::size_t kRecordDataStart = kPageHeaderSize + kHeapHeaderSize;
 constexpr std::size_t kSlotSize = 12U;
 constexpr std::uint32_t kSlotAllocated = 1U;
+constexpr std::uint32_t kSlotDeleted = 0U;
 
 void WriteUInt16At(std::span<std::byte> bytes, std::size_t offset, std::uint16_t value) {
     for (std::size_t index = 0U; index < sizeof(value); ++index) {
@@ -158,11 +159,60 @@ Result<std::vector<std::pair<SlotId, std::vector<std::byte>>>> SlottedPage::Reco
         const SlotId slot_id{raw_slot};
         const auto record = Read(slot_id);
         if (!record.ok()) {
+            if (record.status().code() == ErrorCode::kNotFound) {
+                continue;
+            }
             return record.status();
         }
         records.emplace_back(slot_id, record.value());
     }
     return records;
+}
+
+Status SlottedPage::Erase(SlotId slot_id) {
+    const Status status = Validate();
+    if (!status.ok()) {
+        return status;
+    }
+    const auto slot_count = SlotCount();
+    if (!slot_count.ok()) {
+        return slot_count.status();
+    }
+    if (!slot_id.valid() || slot_id.value() >= slot_count.value()) {
+        return Status::Error(ErrorCode::kOutOfRange, "slot ID does not exist on page")
+            .WithContext("slot_id", ToString(slot_id));
+    }
+    std::span<std::byte> bytes = page_.mutable_bytes();
+    const std::size_t offset = SlotOffset(slot_id);
+    if (ReadUInt32At(bytes, offset + 8U) != kSlotAllocated) {
+        return Status::Error(ErrorCode::kNotFound, "slot is not allocated")
+            .WithContext("slot_id", ToString(slot_id));
+    }
+    WriteUInt32At(bytes, offset + 8U, kSlotDeleted);
+    return page_.Finalize();
+}
+
+Status SlottedPage::Restore(SlotId slot_id) {
+    const Status status = Validate();
+    if (!status.ok()) {
+        return status;
+    }
+    const auto slot_count = SlotCount();
+    if (!slot_count.ok()) {
+        return slot_count.status();
+    }
+    if (!slot_id.valid() || slot_id.value() >= slot_count.value()) {
+        return Status::Error(ErrorCode::kOutOfRange, "slot ID does not exist on page")
+            .WithContext("slot_id", ToString(slot_id));
+    }
+    std::span<std::byte> bytes = page_.mutable_bytes();
+    const std::size_t offset = SlotOffset(slot_id);
+    if (ReadUInt32At(bytes, offset + 8U) != kSlotDeleted) {
+        return Status::Error(ErrorCode::kInvalidArgument, "slot is not deleted")
+            .WithContext("slot_id", ToString(slot_id));
+    }
+    WriteUInt32At(bytes, offset + 8U, kSlotAllocated);
+    return page_.Finalize();
 }
 
 std::size_t SlottedPage::FreeBytes() const {
@@ -250,7 +300,7 @@ Status SlottedPage::Validate() const {
         const std::uint16_t tuple_offset = ReadUInt16At(bytes, offset);
         const std::uint16_t tuple_length = ReadUInt16At(bytes, offset + 2U);
         const std::uint32_t flags = ReadUInt32At(bytes, offset + 8U);
-        if (flags != kSlotAllocated ||
+        if ((flags != kSlotAllocated && flags != kSlotDeleted) ||
             tuple_offset < kRecordDataStart ||
             tuple_offset > free_start ||
             tuple_length > free_start - tuple_offset) {
@@ -351,6 +401,52 @@ Result<Tuple> TableHeap::Read(const Schema& schema, RecordId record_id) const {
         return record.status();
     }
     return DecodeRecord(schema, record.value());
+}
+
+Status TableHeap::Erase(RecordId record_id) {
+    if (!record_id.valid()) {
+        return Status::Error(ErrorCode::kInvalidArgument, "record ID is invalid");
+    }
+    const auto page = page_manager_.ReadPage(record_id.page_id);
+    if (!page.ok()) {
+        return page.status();
+    }
+    if (page.value().type() != PageType::kHeap) {
+        return HeapCorruption("record page is not a heap page");
+    }
+    const auto heap_page = SlottedPage::Load(page.value());
+    if (!heap_page.ok()) {
+        return heap_page.status();
+    }
+    auto mutable_heap_page = std::move(heap_page).value();
+    const Status erase_status = mutable_heap_page.Erase(record_id.slot_id);
+    if (!erase_status.ok()) {
+        return erase_status;
+    }
+    return page_manager_.WritePage(mutable_heap_page.page());
+}
+
+Status TableHeap::Restore(RecordId record_id) {
+    if (!record_id.valid()) {
+        return Status::Error(ErrorCode::kInvalidArgument, "record ID is invalid");
+    }
+    const auto page = page_manager_.ReadPage(record_id.page_id);
+    if (!page.ok()) {
+        return page.status();
+    }
+    if (page.value().type() != PageType::kHeap) {
+        return HeapCorruption("record page is not a heap page");
+    }
+    const auto heap_page = SlottedPage::Load(page.value());
+    if (!heap_page.ok()) {
+        return heap_page.status();
+    }
+    auto mutable_heap_page = std::move(heap_page).value();
+    const Status restore_status = mutable_heap_page.Restore(record_id.slot_id);
+    if (!restore_status.ok()) {
+        return restore_status;
+    }
+    return page_manager_.WritePage(mutable_heap_page.page());
 }
 
 Result<std::vector<Tuple>> TableHeap::Scan(const Schema& schema) const {

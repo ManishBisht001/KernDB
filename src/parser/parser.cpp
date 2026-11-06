@@ -117,6 +117,25 @@ private:
         };
     }
 
+    [[nodiscard]] Result<AstPredicate> ParsePredicate() {
+        const auto column_name = ParseIdentifier();
+        if (!column_name.ok()) {
+            return column_name.status();
+        }
+        const auto equal = Expect(TokenKind::kEqual, "'=' in WHERE predicate");
+        if (!equal.ok()) {
+            return equal.status();
+        }
+        const auto literal = ParseLiteral();
+        if (!literal.ok()) {
+            return literal.status();
+        }
+        return AstPredicate{
+            .column_name = column_name.value(),
+            .literal = literal.value(),
+        };
+    }
+
     [[nodiscard]] Result<AstStatement> ParseStatement() {
         if (Match(TokenKind::kCreate)) {
             if (Match(TokenKind::kTable)) {
@@ -149,7 +168,32 @@ private:
             }
             return AstStatement{std::move(statement).value()};
         }
-        return SyntaxError(Current().span, "expected CREATE, INSERT, or SELECT statement");
+        if (Match(TokenKind::kUpdate)) {
+            const auto statement = ParseUpdate();
+            if (!statement.ok()) {
+                return statement.status();
+            }
+            return AstStatement{std::move(statement).value()};
+        }
+        if (Match(TokenKind::kDelete)) {
+            const auto statement = ParseDelete();
+            if (!statement.ok()) {
+                return statement.status();
+            }
+            return AstStatement{std::move(statement).value()};
+        }
+        if (Match(TokenKind::kBegin)) {
+            return AstStatement{AstBegin{}};
+        }
+        if (Match(TokenKind::kCommit)) {
+            return AstStatement{AstCommit{}};
+        }
+        if (Match(TokenKind::kRollback)) {
+            return AstStatement{AstRollback{}};
+        }
+        return SyntaxError(
+            Current().span,
+            "expected CREATE, INSERT, SELECT, UPDATE, DELETE, BEGIN, COMMIT, or ROLLBACK statement");
     }
 
     [[nodiscard]] Result<AstCreateTable> ParseCreateTable() {
@@ -295,28 +339,77 @@ private:
 
         std::optional<AstPredicate> predicate;
         if (Match(TokenKind::kWhere)) {
-            const auto column_name = ParseIdentifier();
-            if (!column_name.ok()) {
-                return column_name.status();
+            const auto parsed_predicate = ParsePredicate();
+            if (!parsed_predicate.ok()) {
+                return parsed_predicate.status();
             }
-            const auto equal = Expect(TokenKind::kEqual, "'=' in WHERE predicate");
-            if (!equal.ok()) {
-                return equal.status();
-            }
-            const auto literal = ParseLiteral();
-            if (!literal.ok()) {
-                return literal.status();
-            }
-            predicate = AstPredicate{
-                .column_name = column_name.value(),
-                .literal = literal.value(),
-            };
+            predicate = parsed_predicate.value();
         }
 
         return AstSelect{
             .projections = std::move(projections),
             .table_name = table_name.value(),
             .predicate = std::move(predicate),
+        };
+    }
+
+    [[nodiscard]] Result<AstUpdate> ParseUpdate() {
+        const auto table_name = ParseIdentifier();
+        if (!table_name.ok()) {
+            return table_name.status();
+        }
+        const auto set = Expect(TokenKind::kSet, "SET after table name");
+        if (!set.ok()) {
+            return set.status();
+        }
+        const auto column_name = ParseIdentifier();
+        if (!column_name.ok()) {
+            return column_name.status();
+        }
+        const auto equal = Expect(TokenKind::kEqual, "'=' after SET column");
+        if (!equal.ok()) {
+            return equal.status();
+        }
+        const auto value = ParseLiteral();
+        if (!value.ok()) {
+            return value.status();
+        }
+        const auto where = Expect(TokenKind::kWhere, "WHERE after SET value");
+        if (!where.ok()) {
+            return where.status();
+        }
+        const auto predicate = ParsePredicate();
+        if (!predicate.ok()) {
+            return predicate.status();
+        }
+        return AstUpdate{
+            .table_name = table_name.value(),
+            .column_name = column_name.value(),
+            .value = value.value(),
+            .predicate = predicate.value(),
+        };
+    }
+
+    [[nodiscard]] Result<AstDelete> ParseDelete() {
+        const auto from = Expect(TokenKind::kFrom, "FROM after DELETE");
+        if (!from.ok()) {
+            return from.status();
+        }
+        const auto table_name = ParseIdentifier();
+        if (!table_name.ok()) {
+            return table_name.status();
+        }
+        const auto where = Expect(TokenKind::kWhere, "WHERE after table name");
+        if (!where.ok()) {
+            return where.status();
+        }
+        const auto predicate = ParsePredicate();
+        if (!predicate.ok()) {
+            return predicate.status();
+        }
+        return AstDelete{
+            .table_name = table_name.value(),
+            .predicate = predicate.value(),
         };
     }
 

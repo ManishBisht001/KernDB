@@ -24,6 +24,13 @@ KERNDB_TEST(LexerHandlesKeywordsCommentsEscapedStringsAndSpans) {
         });
     KERNDB_EXPECT(string_token != tokens.value().end());
     KERNDB_EXPECT_EQ(std::string("Ada's"), string_token->lexeme);
+
+    const auto mutation_tokens = kerndb::parser::LexSql(
+        "UPDATE people SET name = 'Vikas' WHERE id = 4; DELETE FROM people WHERE id = 4;");
+    KERNDB_EXPECT(mutation_tokens.ok());
+    KERNDB_EXPECT_EQ(kerndb::parser::TokenKind::kUpdate, mutation_tokens.value()[0].kind);
+    KERNDB_EXPECT_EQ(kerndb::parser::TokenKind::kSet, mutation_tokens.value()[2].kind);
+    KERNDB_EXPECT_EQ(kerndb::parser::TokenKind::kDelete, mutation_tokens.value()[11].kind);
 }
 
 KERNDB_TEST(LexerReportsUnexpectedAndUnterminatedInput) {

@@ -26,10 +26,22 @@ LogicalPlan BuildLogicalPlan(const binder::BoundStatement& statement) {
                     .table_id = bound_statement.table_id,
                     .values = bound_statement.values,
                 };
-            } else {
+            } else if constexpr (std::is_same_v<StatementType, binder::BoundSelect>) {
                 return LogicalSelect{
                     .table_id = bound_statement.table_id,
                     .projection_indices = bound_statement.projection_indices,
+                    .predicate = bound_statement.predicate,
+                };
+            } else if constexpr (std::is_same_v<StatementType, binder::BoundUpdate>) {
+                return LogicalUpdate{
+                    .table_id = bound_statement.table_id,
+                    .column_index = bound_statement.column_index,
+                    .value = bound_statement.value,
+                    .predicate = bound_statement.predicate,
+                };
+            } else {
+                return LogicalDelete{
+                    .table_id = bound_statement.table_id,
                     .predicate = bound_statement.predicate,
                 };
             }
@@ -56,6 +68,18 @@ PhysicalPlan BuildPhysicalPlan(const LogicalPlan& plan) {
                 return PhysicalInsert{
                     .table_id = logical_plan.table_id,
                     .values = logical_plan.values,
+                };
+            } else if constexpr (std::is_same_v<PlanType, LogicalUpdate>) {
+                return PhysicalUpdate{
+                    .table_id = logical_plan.table_id,
+                    .column_index = logical_plan.column_index,
+                    .value = logical_plan.value,
+                    .predicate = logical_plan.predicate,
+                };
+            } else if constexpr (std::is_same_v<PlanType, LogicalDelete>) {
+                return PhysicalDelete{
+                    .table_id = logical_plan.table_id,
+                    .predicate = logical_plan.predicate,
                 };
             } else if (logical_plan.predicate.has_value() &&
                        std::holds_alternative<std::int64_t>(logical_plan.predicate->literal)) {

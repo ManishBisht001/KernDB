@@ -42,6 +42,12 @@ enum class TokenKind {
     kSelect,
     kFrom,
     kWhere,
+    kUpdate,
+    kSet,
+    kDelete,
+    kBegin,
+    kCommit,
+    kRollback,
     kInt,
     kText,
 };

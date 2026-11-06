@@ -29,6 +29,11 @@ enum class QueryResultKind : std::uint8_t {
     kCreateTable,
     kCreateIndex,
     kInsert,
+    kUpdate,
+    kDelete,
+    kBegin,
+    kCommit,
+    kRollback,
     kSelect,
 };
 

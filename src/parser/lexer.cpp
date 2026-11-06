@@ -60,6 +60,24 @@ namespace {
     if (normalized == "where") {
         return TokenKind::kWhere;
     }
+    if (normalized == "update") {
+        return TokenKind::kUpdate;
+    }
+    if (normalized == "set") {
+        return TokenKind::kSet;
+    }
+    if (normalized == "delete") {
+        return TokenKind::kDelete;
+    }
+    if (normalized == "begin") {
+        return TokenKind::kBegin;
+    }
+    if (normalized == "commit") {
+        return TokenKind::kCommit;
+    }
+    if (normalized == "rollback") {
+        return TokenKind::kRollback;
+    }
     if (normalized == "int") {
         return TokenKind::kInt;
     }
@@ -283,6 +301,18 @@ std::string_view TokenKindName(TokenKind kind) noexcept {
             return "FROM";
         case TokenKind::kWhere:
             return "WHERE";
+        case TokenKind::kUpdate:
+            return "UPDATE";
+        case TokenKind::kSet:
+            return "SET";
+        case TokenKind::kDelete:
+            return "DELETE";
+        case TokenKind::kBegin:
+            return "BEGIN";
+        case TokenKind::kCommit:
+            return "COMMIT";
+        case TokenKind::kRollback:
+            return "ROLLBACK";
         case TokenKind::kInt:
             return "INT";
         case TokenKind::kText:

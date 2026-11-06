@@ -53,6 +53,33 @@ struct AstSelect {
     std::optional<AstPredicate> predicate;
 };
 
-using AstStatement = std::variant<AstCreateTable, AstCreateIndex, AstInsert, AstSelect>;
+struct AstUpdate {
+    AstIdentifier table_name;
+    AstIdentifier column_name;
+    AstLiteral value;
+    AstPredicate predicate;
+};
+
+struct AstDelete {
+    AstIdentifier table_name;
+    AstPredicate predicate;
+};
+
+struct AstBegin {};
+
+struct AstCommit {};
+
+struct AstRollback {};
+
+using AstStatement = std::variant<
+    AstCreateTable,
+    AstCreateIndex,
+    AstInsert,
+    AstSelect,
+    AstUpdate,
+    AstDelete,
+    AstBegin,
+    AstCommit,
+    AstRollback>;
 
 }  // namespace kerndb::parser

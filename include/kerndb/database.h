@@ -40,12 +40,19 @@ public:
     [[nodiscard]] Result<QueryResult> Execute(std::string_view sql);
 
 private:
+    [[nodiscard]] Result<QueryResult> BeginTransaction();
+    [[nodiscard]] Result<QueryResult> CommitTransaction();
+    [[nodiscard]] Result<QueryResult> RollbackTransaction();
+    [[nodiscard]] Status RollbackActiveTransaction();
+
     Database(
         std::unique_ptr<InMemoryCatalog> catalog,
         std::unique_ptr<storage::TableStorage> table_storage);
 
     std::unique_ptr<InMemoryCatalog> catalog_;
     std::unique_ptr<storage::TableStorage> table_storage_;
+    std::unique_ptr<InMemoryCatalog> in_memory_transaction_snapshot_;
+    bool explicit_transaction_active_{false};
 };
 
 }  // namespace kerndb

@@ -31,6 +31,29 @@ KERNDB_TEST(ParserBuildsAllSupportedStatementKinds) {
     const auto& select_statement = std::get<kerndb::parser::AstSelect>(select.value());
     KERNDB_EXPECT_EQ(std::size_t{2U}, select_statement.projections.size());
     KERNDB_EXPECT(select_statement.predicate.has_value());
+
+    const auto update = kerndb::parser::ParseSql(
+        "UPDATE people SET name = 'Vikas Kumar' WHERE id = 4;");
+    KERNDB_EXPECT(update.ok());
+    const auto& update_statement = std::get<kerndb::parser::AstUpdate>(update.value());
+    KERNDB_EXPECT_EQ(std::string("name"), update_statement.column_name.text);
+    KERNDB_EXPECT_EQ(std::int64_t{4}, std::get<std::int64_t>(update_statement.predicate.literal.value));
+
+    const auto delete_statement = kerndb::parser::ParseSql("DELETE FROM people WHERE id = 4;");
+    KERNDB_EXPECT(delete_statement.ok());
+    KERNDB_EXPECT(std::holds_alternative<kerndb::parser::AstDelete>(delete_statement.value()));
+
+    const auto begin = kerndb::parser::ParseSql("BEGIN;");
+    KERNDB_EXPECT(begin.ok());
+    KERNDB_EXPECT(std::holds_alternative<kerndb::parser::AstBegin>(begin.value()));
+
+    const auto commit = kerndb::parser::ParseSql("COMMIT");
+    KERNDB_EXPECT(commit.ok());
+    KERNDB_EXPECT(std::holds_alternative<kerndb::parser::AstCommit>(commit.value()));
+
+    const auto rollback = kerndb::parser::ParseSql("ROLLBACK;");
+    KERNDB_EXPECT(rollback.ok());
+    KERNDB_EXPECT(std::holds_alternative<kerndb::parser::AstRollback>(rollback.value()));
 }
 
 KERNDB_TEST(ParserRejectsUnsupportedAndMultiStatementSyntax) {
@@ -43,4 +66,10 @@ KERNDB_TEST(ParserRejectsUnsupportedAndMultiStatementSyntax) {
 
     const auto malformed = kerndb::parser::ParseSql("CREATE TABLE people (id)");
     KERNDB_EXPECT(!malformed.ok());
+
+    const auto unsafe_update = kerndb::parser::ParseSql("UPDATE people SET id = 4");
+    KERNDB_EXPECT(!unsafe_update.ok());
+
+    KERNDB_EXPECT(!kerndb::parser::ParseSql("BEGIN TRANSACTION").ok());
+    KERNDB_EXPECT(!kerndb::parser::ParseSql("COMMIT AND CHAIN").ok());
 }

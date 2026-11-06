@@ -38,6 +38,24 @@ struct BoundSelect {
     std::optional<BoundPredicate> predicate;
 };
 
-using BoundStatement = std::variant<BoundCreateTable, BoundCreateIndex, BoundInsert, BoundSelect>;
+struct BoundUpdate {
+    TableId table_id;
+    std::size_t column_index;
+    Value value;
+    BoundPredicate predicate;
+};
+
+struct BoundDelete {
+    TableId table_id;
+    BoundPredicate predicate;
+};
+
+using BoundStatement = std::variant<
+    BoundCreateTable,
+    BoundCreateIndex,
+    BoundInsert,
+    BoundSelect,
+    BoundUpdate,
+    BoundDelete>;
 
 }  // namespace kerndb::binder

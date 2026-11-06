@@ -39,6 +39,32 @@ namespace {
     return BindingError(name.span, "column does not exist: " + normalized);
 }
 
+[[nodiscard]] Result<BoundPredicate> BindPredicate(
+    const parser::AstPredicate& predicate,
+    const InMemoryTable& table) {
+    const auto column_index = ResolveColumn(predicate.column_name, table);
+    if (!column_index.ok()) {
+        return column_index.status();
+    }
+    const ColumnDefinition& column = table.schema[column_index.value()];
+    if (ValueType(predicate.literal.value) != column.type) {
+        return Status::Error(
+                   ErrorCode::kType,
+                   "WHERE literal type does not match column type")
+            .WithContext("column", column.name)
+            .WithContext("expected", std::string(ColumnTypeName(column.type)))
+            .WithContext("offset", std::to_string(predicate.literal.span.begin.offset))
+            .WithContext("line", std::to_string(predicate.literal.span.begin.line))
+            .WithContext(
+                "column_number",
+                std::to_string(predicate.literal.span.begin.column));
+    }
+    return BoundPredicate{
+        .column_index = column_index.value(),
+        .literal = predicate.literal.value,
+    };
+}
+
 [[nodiscard]] Result<BoundStatement> BindCreateTable(const parser::AstCreateTable& statement) {
     Schema schema;
     schema.reserve(statement.columns.size());
@@ -138,33 +164,68 @@ namespace {
 
     std::optional<BoundPredicate> predicate;
     if (statement.predicate.has_value()) {
-        const auto index = ResolveColumn(statement.predicate->column_name, *table.value());
-        if (!index.ok()) {
-            return index.status();
+        const auto bound_predicate = BindPredicate(statement.predicate.value(), *table.value());
+        if (!bound_predicate.ok()) {
+            return bound_predicate.status();
         }
-        const ColumnDefinition& column = table.value()->schema[index.value()];
-        if (ValueType(statement.predicate->literal.value) != column.type) {
-            return Status::Error(
-                       ErrorCode::kType,
-                       "WHERE literal type does not match column type")
-                .WithContext("column", column.name)
-                .WithContext("expected", std::string(ColumnTypeName(column.type)))
-                .WithContext("offset", std::to_string(statement.predicate->literal.span.begin.offset))
-                .WithContext("line", std::to_string(statement.predicate->literal.span.begin.line))
-                .WithContext(
-                    "column_number",
-                    std::to_string(statement.predicate->literal.span.begin.column));
-        }
-        predicate = BoundPredicate{
-            .column_index = index.value(),
-            .literal = statement.predicate->literal.value,
-        };
+        predicate = bound_predicate.value();
     }
 
     return BoundStatement{BoundSelect{
         .table_id = table.value()->id,
         .projection_indices = std::move(projections),
         .predicate = std::move(predicate),
+    }};
+}
+
+[[nodiscard]] Result<BoundStatement> BindUpdate(
+    const parser::AstUpdate& statement,
+    const InMemoryCatalog& catalog) {
+    const auto table = ResolveTable(statement.table_name, catalog);
+    if (!table.ok()) {
+        return table.status();
+    }
+    const auto column_index = ResolveColumn(statement.column_name, *table.value());
+    if (!column_index.ok()) {
+        return column_index.status();
+    }
+    const ColumnDefinition& column = table.value()->schema[column_index.value()];
+    if (ValueType(statement.value.value) != column.type) {
+        return Status::Error(
+                   ErrorCode::kType,
+                   "UPDATE literal type does not match column type")
+            .WithContext("column", column.name)
+            .WithContext("expected", std::string(ColumnTypeName(column.type)))
+            .WithContext("offset", std::to_string(statement.value.span.begin.offset))
+            .WithContext("line", std::to_string(statement.value.span.begin.line))
+            .WithContext("column_number", std::to_string(statement.value.span.begin.column));
+    }
+    const auto predicate = BindPredicate(statement.predicate, *table.value());
+    if (!predicate.ok()) {
+        return predicate.status();
+    }
+    return BoundStatement{BoundUpdate{
+        .table_id = table.value()->id,
+        .column_index = column_index.value(),
+        .value = statement.value.value,
+        .predicate = predicate.value(),
+    }};
+}
+
+[[nodiscard]] Result<BoundStatement> BindDelete(
+    const parser::AstDelete& statement,
+    const InMemoryCatalog& catalog) {
+    const auto table = ResolveTable(statement.table_name, catalog);
+    if (!table.ok()) {
+        return table.status();
+    }
+    const auto predicate = BindPredicate(statement.predicate, *table.value());
+    if (!predicate.ok()) {
+        return predicate.status();
+    }
+    return BoundStatement{BoundDelete{
+        .table_id = table.value()->id,
+        .predicate = predicate.value(),
     }};
 }
 
@@ -182,8 +243,16 @@ Result<BoundStatement> BindStatement(
                 return BindCreateIndex(concrete_statement, catalog);
             } else if constexpr (std::is_same_v<StatementType, parser::AstInsert>) {
                 return BindInsert(concrete_statement, catalog);
-            } else {
+            } else if constexpr (std::is_same_v<StatementType, parser::AstSelect>) {
                 return BindSelect(concrete_statement, catalog);
+            } else if constexpr (std::is_same_v<StatementType, parser::AstUpdate>) {
+                return BindUpdate(concrete_statement, catalog);
+            } else if constexpr (std::is_same_v<StatementType, parser::AstDelete>) {
+                return BindDelete(concrete_statement, catalog);
+            } else {
+                return Status::Error(
+                    ErrorCode::kUnsupported,
+                    "transaction control statements are handled by Database");
             }
         },
         statement);

@@ -37,8 +37,8 @@ INSERT INTO people VALUES (1, 'Ada');
 SELECT id, name FROM people WHERE id = 1;
 ~~~
 
-Joins, aggregates, NULL, secondary indexes, multi-statement transactions,
-concurrent writers, and crash guarantees are later milestones.
+Joins, aggregates, NULL, concurrent writers, and crash guarantees are later
+milestones. Phase 5 adds explicit single-threaded multi-statement transactions.
 
 ## Recommended architecture
 
@@ -241,9 +241,12 @@ ACTIVE -> COMMITTED
 ACTIVE -> ABORTING -> ABORTED
 ~~~
 
-The transaction manager owns IDs, state transitions, write sets, last LSN, and
-the current session transaction. Autocommit wraps one statement; explicit BEGIN,
-COMMIT, and ROLLBACK arrive later.
+The mature transaction manager owns IDs, state transitions, write sets, last
+LSN, and each session's transaction. The current Phase 5 implementation is the
+single-threaded precursor: `Database` owns at most one explicit transaction,
+and persistent storage retains statement undo actions until `COMMIT` or
+`ROLLBACK`. With no explicit transaction, each mutation keeps autocommit
+behavior. The in-memory backend restores a catalog snapshot on rollback.
 
 The recommended initial concurrent model is **strict two-phase locking (strict
 2PL)**. The lock manager grants logical table, RID, and later index-key resources
@@ -459,20 +462,25 @@ unindexed queries remain correct heap scans.
 
 **Goal:** Add explicit transaction semantics before session interleaving.
 
-**Components:** BEGIN/COMMIT/ROLLBACK; lifecycle/write set; update/delete; index
-maintenance; initial constraints; autocommit; pre-WAL abort mechanism.
+**Implemented behavior:** SQL `BEGIN`, `COMMIT`, and `ROLLBACK`; one active
+transaction per `Database`; persistent INSERT/UPDATE/DELETE undo retained until
+completion; in-memory rollback through a catalog snapshot; DDL rejection inside
+transactions; statement-local compensation; autocommit; close-time rollback.
 
 **Dependencies:** Phase 4 access methods and planner/executor.
 
-**Expected files/modules:** src/concurrency/transaction, mutation executors,
-transaction grammar/binding, statement-atomicity documentation.
+**Implementation areas:** parser AST/token support, Database transaction
+lifecycle, the existing PersistentStorage mutation context, and integration
+tests over persistent heap and B+ tree pages.
 
-**Tests:** autocommit; commit/rollback; rejected post-abort work; update/delete;
-index consistency; atomic constraint failures; mutation failure injection;
-orderly reopen.
+**Tests:** autocommit; commit/rollback and clean reopen; update/delete and
+multiple-mutation reverse undo; index/RID consistency; statement failure
+atomicity and continued transaction use; mutation failure injection; active
+transaction close rollback.
 
-**Working at end:** one thread supports correct explicit and autocommit
-transactions. Crash atomicity/concurrent sessions are not promised.
+**Working at end:** one thread supports explicit and autocommit transactions
+during normal execution and orderly shutdown. Transactional DDL, concurrent
+sessions, crash atomicity, and recovery are not promised.
 
 ### Phase 6 — Concurrent sessions and strict 2PL
 

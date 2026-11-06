@@ -37,11 +37,25 @@ struct PhysicalIndexScan {
     binder::BoundPredicate predicate;
 };
 
+struct PhysicalUpdate {
+    TableId table_id;
+    std::size_t column_index;
+    Value value;
+    binder::BoundPredicate predicate;
+};
+
+struct PhysicalDelete {
+    TableId table_id;
+    binder::BoundPredicate predicate;
+};
+
 using PhysicalPlan = std::variant<
     PhysicalCreateTable,
     PhysicalCreateIndex,
     PhysicalInsert,
     PhysicalSequentialScan,
-    PhysicalIndexScan>;
+    PhysicalIndexScan,
+    PhysicalUpdate,
+    PhysicalDelete>;
 
 }  // namespace kerndb::planner

@@ -2,12 +2,38 @@
 
 #include <cstddef>
 #include <optional>
+#include <set>
 #include <type_traits>
 #include <utility>
 #include <variant>
 
 namespace kerndb::execution {
 namespace {
+
+[[nodiscard]] Status ValidateInMemoryUniqueIndexes(
+    const InMemoryCatalog& catalog,
+    const InMemoryTable& table,
+    const std::vector<Tuple>& tuples) {
+    for (std::size_t column_index = 0U; column_index < table.schema.size(); ++column_index) {
+        const auto index = catalog.FindIndexForTableColumn(table.id, column_index);
+        if (!index.ok()) {
+            if (index.status().code() == ErrorCode::kNotFound) {
+                continue;
+            }
+            return index.status();
+        }
+        std::set<std::int64_t> keys;
+        for (const Tuple& tuple : tuples) {
+            const std::int64_t key = std::get<std::int64_t>(tuple[column_index]);
+            if (!keys.insert(key).second) {
+                return Status::Error(ErrorCode::kAlreadyExists, "duplicate key violates a unique index")
+                    .WithContext("index", index.value()->name)
+                    .WithContext("key", std::to_string(key));
+            }
+        }
+    }
+    return Status::Ok();
+}
 
 [[nodiscard]] Result<QueryResult> ExecuteCreateTable(
     const planner::PhysicalCreateTable& plan,
@@ -39,6 +65,22 @@ namespace {
 [[nodiscard]] Result<QueryResult> ExecuteCreateIndex(
     const planner::PhysicalCreateIndex& plan,
     ExecutionContext& context) {
+    const auto table = context.catalog.FindTableById(plan.table_id);
+    if (!table.ok()) {
+        return table.status();
+    }
+    if (context.table_storage == nullptr) {
+        std::set<std::int64_t> keys;
+        for (const Tuple& tuple : table.value()->tuples) {
+            const std::int64_t key = std::get<std::int64_t>(tuple[plan.column_index]);
+            if (!keys.insert(key).second) {
+                return Status::Error(ErrorCode::kAlreadyExists, "duplicate key violates a unique index")
+                    .WithContext("index", plan.index_name)
+                    .WithContext("key", std::to_string(key));
+            }
+        }
+    }
+
     const auto index_id = context.catalog.CreateIndex(
         plan.index_name,
         plan.table_id,
@@ -87,6 +129,15 @@ namespace {
             return record_id.status();
         }
     } else {
+        std::vector<Tuple> prospective_tuples = table.value()->tuples;
+        prospective_tuples.push_back(plan.values);
+        const Status uniqueness = ValidateInMemoryUniqueIndexes(
+            context.catalog,
+            *table.value(),
+            prospective_tuples);
+        if (!uniqueness.ok()) {
+            return uniqueness;
+        }
         table.value()->tuples.push_back(plan.values);
     }
     return QueryResult{
@@ -94,6 +145,91 @@ namespace {
         .columns = {},
         .rows = {},
         .rows_affected = 1U,
+    };
+}
+
+[[nodiscard]] Result<QueryResult> ExecuteUpdate(
+    const planner::PhysicalUpdate& plan,
+    ExecutionContext& context) {
+    const auto table = context.catalog.FindTableById(plan.table_id);
+    if (!table.ok()) {
+        return table.status();
+    }
+
+    std::uint64_t rows_affected = 0U;
+    if (context.table_storage != nullptr) {
+        const auto updated = context.table_storage->UpdateMatching(
+            *table.value(),
+            plan.column_index,
+            plan.value,
+            plan.predicate.column_index,
+            plan.predicate.literal);
+        if (!updated.ok()) {
+            return updated.status();
+        }
+        rows_affected = updated.value();
+    } else {
+        std::vector<Tuple> prospective_tuples = table.value()->tuples;
+        for (Tuple& tuple : prospective_tuples) {
+            if (ValuesEqual(tuple[plan.predicate.column_index], plan.predicate.literal)) {
+                tuple[plan.column_index] = plan.value;
+                ++rows_affected;
+            }
+        }
+        const Status uniqueness = ValidateInMemoryUniqueIndexes(
+            context.catalog,
+            *table.value(),
+            prospective_tuples);
+        if (!uniqueness.ok()) {
+            return uniqueness;
+        }
+        table.value()->tuples = std::move(prospective_tuples);
+    }
+
+    return QueryResult{
+        .kind = QueryResultKind::kUpdate,
+        .columns = {},
+        .rows = {},
+        .rows_affected = rows_affected,
+    };
+}
+
+[[nodiscard]] Result<QueryResult> ExecuteDelete(
+    const planner::PhysicalDelete& plan,
+    ExecutionContext& context) {
+    const auto table = context.catalog.FindTableById(plan.table_id);
+    if (!table.ok()) {
+        return table.status();
+    }
+
+    std::uint64_t rows_affected = 0U;
+    if (context.table_storage != nullptr) {
+        const auto deleted = context.table_storage->DeleteMatching(
+            *table.value(),
+            plan.predicate.column_index,
+            plan.predicate.literal);
+        if (!deleted.ok()) {
+            return deleted.status();
+        }
+        rows_affected = deleted.value();
+    } else {
+        std::vector<Tuple> remaining_tuples;
+        remaining_tuples.reserve(table.value()->tuples.size());
+        for (const Tuple& tuple : table.value()->tuples) {
+            if (ValuesEqual(tuple[plan.predicate.column_index], plan.predicate.literal)) {
+                ++rows_affected;
+            } else {
+                remaining_tuples.push_back(tuple);
+            }
+        }
+        table.value()->tuples = std::move(remaining_tuples);
+    }
+
+    return QueryResult{
+        .kind = QueryResultKind::kDelete,
+        .columns = {},
+        .rows = {},
+        .rows_affected = rows_affected,
     };
 }
 
@@ -220,6 +356,10 @@ Result<QueryResult> ExecutePlan(
                 return ExecuteInsert(physical_plan, context);
             } else if constexpr (std::is_same_v<PlanType, planner::PhysicalIndexScan>) {
                 return ExecuteIndexScan(physical_plan, context);
+            } else if constexpr (std::is_same_v<PlanType, planner::PhysicalUpdate>) {
+                return ExecuteUpdate(physical_plan, context);
+            } else if constexpr (std::is_same_v<PlanType, planner::PhysicalDelete>) {
+                return ExecuteDelete(physical_plan, context);
             } else {
                 return ExecuteSequentialScan(physical_plan, context);
             }

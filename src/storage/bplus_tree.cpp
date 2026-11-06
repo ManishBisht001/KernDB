@@ -361,6 +361,49 @@ Result<void> BPlusTree::Insert(std::int64_t key, RecordId record_id) {
     }
 }
 
+Result<void> BPlusTree::Remove(std::int64_t key, RecordId record_id) {
+    if (!record_id.valid()) {
+        return TreeError(ErrorCode::kInvalidArgument, "cannot remove an invalid record ID");
+    }
+
+    PageId current_page_id = root_page_id_;
+    while (true) {
+        const auto read_node = ReadNode(current_page_id);
+        if (!read_node.ok()) {
+            return read_node.status();
+        }
+        Node node = read_node.value();
+        if (node.kind == NodeKind::kInternal) {
+            const auto child = std::upper_bound(node.keys.begin(), node.keys.end(), key);
+            const std::size_t child_index = static_cast<std::size_t>(child - node.keys.begin());
+            current_page_id = node.children[child_index];
+            continue;
+        }
+
+        const auto position = std::lower_bound(
+            node.entries.begin(),
+            node.entries.end(),
+            key,
+            [](const BPlusTreeEntry& entry, std::int64_t candidate) {
+                return entry.key < candidate;
+            });
+        if (position == node.entries.end() || position->key != key) {
+            return TreeError(ErrorCode::kNotFound, "index key does not exist")
+                .WithContext("key", std::to_string(key));
+        }
+        if (position->record_id != record_id) {
+            return TreeError(ErrorCode::kCorruption, "index key refers to an unexpected record ID")
+                .WithContext("key", std::to_string(key));
+        }
+        node.entries.erase(position);
+        const Status write_status = WriteNode(current_page_id, node);
+        if (!write_status.ok()) {
+            return write_status;
+        }
+        return Result<void>{};
+    }
+}
+
 Result<RecordId> BPlusTree::Search(std::int64_t key) const {
     PageId current_page_id = root_page_id_;
     while (true) {

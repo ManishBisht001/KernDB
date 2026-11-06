@@ -94,3 +94,30 @@ KERNDB_TEST(BinderRejectsDuplicateColumnsAndInvalidDataReferences) {
     KERNDB_EXPECT(!wrong_where_bound.ok());
     KERNDB_EXPECT_EQ(kerndb::ErrorCode::kType, wrong_where_bound.status().code());
 }
+
+KERNDB_TEST(BinderResolvesUpdateAndDeleteMutations) {
+    kerndb::InMemoryCatalog catalog = MakeCatalog();
+
+    const auto update_ast = kerndb::parser::ParseSql(
+        "UPDATE people SET name = 'Vikas Kumar' WHERE id = 4");
+    KERNDB_EXPECT(update_ast.ok());
+    const auto update = kerndb::binder::BindStatement(update_ast.value(), catalog);
+    KERNDB_EXPECT(update.ok());
+    const auto& bound_update = std::get<kerndb::binder::BoundUpdate>(update.value());
+    KERNDB_EXPECT_EQ(std::size_t{1U}, bound_update.column_index);
+    KERNDB_EXPECT_EQ(std::size_t{0U}, bound_update.predicate.column_index);
+
+    const auto delete_ast = kerndb::parser::ParseSql("DELETE FROM people WHERE id = 4");
+    KERNDB_EXPECT(delete_ast.ok());
+    const auto deleted = kerndb::binder::BindStatement(delete_ast.value(), catalog);
+    KERNDB_EXPECT(deleted.ok());
+    const auto& bound_delete = std::get<kerndb::binder::BoundDelete>(deleted.value());
+    KERNDB_EXPECT_EQ(std::size_t{0U}, bound_delete.predicate.column_index);
+
+    const auto mismatched_update = kerndb::parser::ParseSql(
+        "UPDATE people SET id = 'four' WHERE id = 4");
+    KERNDB_EXPECT(mismatched_update.ok());
+    const auto rejected = kerndb::binder::BindStatement(mismatched_update.value(), catalog);
+    KERNDB_EXPECT(!rejected.ok());
+    KERNDB_EXPECT_EQ(kerndb::ErrorCode::kType, rejected.status().code());
+}

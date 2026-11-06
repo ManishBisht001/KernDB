@@ -1,9 +1,13 @@
 #include "storage/persistent_storage.h"
 
 #include <filesystem>
+#include <functional>
+#include <iterator>
 #include <memory>
+#include <set>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "kerndb/storage/bplus_tree.h"
 #include "kerndb/storage/database_metadata.h"
@@ -34,7 +38,115 @@ namespace {
     return Status::Ok();
 }
 
+// This is deliberately a small, single-threaded logical mutation context. It
+// records compensating actions after each completed storage change. It is not
+// a WAL and makes no crash-recovery claim, but it keeps failed API mutations
+// from exposing partial heap/index changes during the current process.
+using UndoActions = std::vector<std::function<Status()>>;
+
+[[nodiscard]] Status RollbackActions(UndoActions& undo_actions) {
+    Status first_error = Status::Ok();
+    for (auto iterator = undo_actions.rbegin(); iterator != undo_actions.rend(); ++iterator) {
+        const Status status = (*iterator)();
+        if (!status.ok() && first_error.ok()) {
+            first_error = status;
+        }
+    }
+    undo_actions.clear();
+    return first_error;
+}
+
+class Mutation {
+public:
+    explicit Mutation(UndoActions* transaction_undo_actions = nullptr)
+        : transaction_undo_actions_(transaction_undo_actions) {}
+
+    Mutation(const Mutation&) = delete;
+    Mutation& operator=(const Mutation&) = delete;
+
+    ~Mutation() {
+        if (!finished_) {
+            static_cast<void>(Rollback());
+        }
+    }
+
+    void AddUndo(std::function<Status()> undo) {
+        undo_actions_.push_back(std::move(undo));
+    }
+
+    [[nodiscard]] Status Abort(const Status& mutation_error) {
+        const Status rollback_status = Rollback();
+        if (rollback_status.ok()) {
+            return mutation_error;
+        }
+        return Status::Error(ErrorCode::kInternal, "mutation rollback failed")
+            .WithContext("mutation_error", mutation_error.ToString())
+            .WithContext("rollback_error", rollback_status.ToString());
+    }
+
+    void Commit() {
+        if (transaction_undo_actions_ != nullptr) {
+            transaction_undo_actions_->insert(
+                transaction_undo_actions_->end(),
+                std::make_move_iterator(undo_actions_.begin()),
+                std::make_move_iterator(undo_actions_.end()));
+        }
+        undo_actions_.clear();
+        finished_ = true;
+    }
+
+private:
+    [[nodiscard]] Status Rollback() {
+        const Status first_error = RollbackActions(undo_actions_);
+        finished_ = true;
+        return first_error;
+    }
+
+    UndoActions undo_actions_;
+    UndoActions* transaction_undo_actions_{nullptr};
+    bool finished_{false};
+};
+
 }  // namespace
+
+#if defined(KERNDB_ENABLE_TEST_HOOKS)
+void PersistentStorage::FailNextUpdateAfterRowMutationForTesting() noexcept {
+    fail_after_next_update_row_for_testing_ = true;
+}
+#endif
+
+PersistentStorage::~PersistentStorage() {
+    if (transaction_active_) {
+        static_cast<void>(RollbackTransaction());
+    }
+}
+
+Status PersistentStorage::BeginTransaction() {
+    if (transaction_active_) {
+        return Status::Error(ErrorCode::kInvalidArgument, "a transaction is already active");
+    }
+    transaction_undo_actions_.clear();
+    transaction_active_ = true;
+    return Status::Ok();
+}
+
+Status PersistentStorage::CommitTransaction() {
+    if (!transaction_active_) {
+        return Status::Error(ErrorCode::kInvalidArgument, "there is no active transaction to commit");
+    }
+    transaction_undo_actions_.clear();
+    transaction_active_ = false;
+    return Status::Ok();
+}
+
+Status PersistentStorage::RollbackTransaction() {
+    if (!transaction_active_) {
+        return Status::Error(ErrorCode::kInvalidArgument, "there is no active transaction to roll back");
+    }
+    const Status rollback_status = RollbackActions(transaction_undo_actions_);
+    transaction_active_ = false;
+    return rollback_status;
+}
 
 Result<std::unique_ptr<PersistentStorage>> PersistentStorage::Open(
     const std::filesystem::path& database_directory,
@@ -152,24 +264,27 @@ Result<void> PersistentStorage::CreateTable(const InMemoryTable& table) {
 }
 
 Result<RecordId> PersistentStorage::Insert(const InMemoryTable& table, const Tuple& tuple) {
-    for (const auto& [unused_id, index] : indexes_by_id_) {
-        static_cast<void>(unused_id);
-        if (index.table_id != table.id) {
-            continue;
-        }
-        const auto index_pages = GetIndexPages(index.id, false);
+    const auto pages = GetTablePages(table.id, false);
+    if (!pages.ok()) {
+        return pages.status();
+    }
+    TableHeap heap{*pages.value()};
+
+    const std::vector<InMemoryIndex*> indexes = IndexesForTable(table.id);
+    for (const InMemoryIndex* index : indexes) {
+        const auto index_pages = GetIndexPages(index->id, false);
         if (!index_pages.ok()) {
             return index_pages.status();
         }
-        const auto tree = BPlusTree::Open(*index_pages.value(), index.root_page_id);
+        const auto tree = BPlusTree::Open(*index_pages.value(), index->root_page_id);
         if (!tree.ok()) {
             return tree.status();
         }
-        const std::int64_t key = std::get<std::int64_t>(tuple[index.column_index]);
+        const std::int64_t key = std::get<std::int64_t>(tuple[index->column_index]);
         const auto existing = tree.value().Search(key);
         if (existing.ok()) {
             return Status::Error(ErrorCode::kAlreadyExists, "duplicate key violates a unique index")
-                .WithContext("index", index.name)
+                .WithContext("index", index->name)
                 .WithContext("key", std::to_string(key));
         }
         if (existing.status().code() != ErrorCode::kNotFound) {
@@ -177,48 +292,212 @@ Result<RecordId> PersistentStorage::Insert(const InMemoryTable& table, const Tup
         }
     }
 
+    Mutation mutation{transaction_active_ ? &transaction_undo_actions_ : nullptr};
+    const auto record_id = heap.Insert(table.schema, tuple);
+    if (!record_id.ok()) {
+        return record_id.status();
+    }
+    mutation.AddUndo([table_pages = pages.value(), inserted_record_id = record_id.value()] {
+        TableHeap undo_heap{*table_pages};
+        return undo_heap.Erase(inserted_record_id);
+    });
+
+    for (InMemoryIndex* index : indexes) {
+        const std::int64_t key = std::get<std::int64_t>(tuple[index->column_index]);
+        const Status insert_status = InsertIndexEntry(*index, key, record_id.value());
+        if (!insert_status.ok()) {
+            return mutation.Abort(insert_status);
+        }
+        mutation.AddUndo([this, index_id = index->id, key, inserted_record_id = record_id.value()] {
+            const auto found = indexes_by_id_.find(index_id.value());
+            if (found == indexes_by_id_.end()) {
+                return Status::Error(ErrorCode::kInternal, "rollback index metadata is missing");
+            }
+            return RemoveIndexEntry(found->second, key, inserted_record_id);
+        });
+    }
+
+    mutation.Commit();
+    return record_id.value();
+}
+
+Result<std::uint64_t> PersistentStorage::UpdateMatching(
+    const InMemoryTable& table,
+    std::size_t column_index,
+    const Value& value,
+    std::size_t predicate_column_index,
+    const Value& predicate_value) {
     const auto pages = GetTablePages(table.id, false);
     if (!pages.ok()) {
         return pages.status();
     }
     TableHeap heap{*pages.value()};
-    const auto record_id = heap.Insert(table.schema, tuple);
-    if (!record_id.ok()) {
-        return record_id.status();
+    const auto records = heap.ScanWithRecordIds(table.schema);
+    if (!records.ok()) {
+        return records.status();
     }
-    for (auto& [unused_id, index] : indexes_by_id_) {
-        static_cast<void>(unused_id);
-        if (index.table_id != table.id) {
-            continue;
-        }
-        const auto index_pages = GetIndexPages(index.id, false);
-        if (!index_pages.ok()) {
-            return index_pages.status();
-        }
-        auto tree = BPlusTree::Open(*index_pages.value(), index.root_page_id);
-        if (!tree.ok()) {
-            return tree.status();
-        }
-        const std::int64_t key = std::get<std::int64_t>(tuple[index.column_index]);
-        const auto insert_status = tree.value().Insert(key, record_id.value());
-        if (!insert_status.ok()) {
-            return insert_status.status();
-        }
-        if (tree.value().root_page_id() != index.root_page_id) {
-            InMemoryIndex updated = index;
-            updated.root_page_id = tree.value().root_page_id();
-            const Status persist_status = index_catalog_store_.Append(updated);
-            if (!persist_status.ok()) {
-                return persist_status;
-            }
-            const Status catalog_status = catalog_->UpdateIndexRoot(updated.id, updated.root_page_id);
-            if (!catalog_status.ok()) {
-                return catalog_status;
-            }
-            index = std::move(updated);
+
+    std::vector<std::pair<RecordId, Tuple>> matches;
+    for (const auto& record : records.value()) {
+        if (ValuesEqual(record.second[predicate_column_index], predicate_value)) {
+            matches.push_back(record);
         }
     }
-    return record_id.value();
+
+    const std::vector<InMemoryIndex*> indexes = IndexesForTable(table.id);
+    for (const InMemoryIndex* index : indexes) {
+        std::set<std::int64_t> final_keys;
+        for (const auto& [record_id, original_tuple] : records.value()) {
+            static_cast<void>(record_id);
+            Tuple final_tuple = original_tuple;
+            if (ValuesEqual(original_tuple[predicate_column_index], predicate_value)) {
+                final_tuple[column_index] = value;
+            }
+            const std::int64_t key = std::get<std::int64_t>(final_tuple[index->column_index]);
+            if (!final_keys.insert(key).second) {
+                return Status::Error(ErrorCode::kAlreadyExists, "duplicate key violates a unique index")
+                    .WithContext("index", index->name)
+                    .WithContext("key", std::to_string(key));
+            }
+        }
+    }
+
+    for (const auto& [record_id, original_tuple] : matches) {
+        for (const InMemoryIndex* index : indexes) {
+            const std::int64_t old_key = std::get<std::int64_t>(original_tuple[index->column_index]);
+            const Status verification = VerifyIndexEntry(*index, old_key, record_id);
+            if (!verification.ok()) {
+                return verification;
+            }
+        }
+    }
+
+    Mutation mutation{transaction_active_ ? &transaction_undo_actions_ : nullptr};
+    for (const auto& [old_record_id, original_tuple] : matches) {
+        Tuple replacement = original_tuple;
+        replacement[column_index] = value;
+        const auto new_record_id = heap.Insert(table.schema, replacement);
+        if (!new_record_id.ok()) {
+            return mutation.Abort(new_record_id.status());
+        }
+        mutation.AddUndo([table_pages = pages.value(), inserted_record_id = new_record_id.value()] {
+            TableHeap undo_heap{*table_pages};
+            return undo_heap.Erase(inserted_record_id);
+        });
+
+        for (InMemoryIndex* index : indexes) {
+            const std::int64_t old_key = std::get<std::int64_t>(original_tuple[index->column_index]);
+            const std::int64_t new_key = std::get<std::int64_t>(replacement[index->column_index]);
+            const Status remove_status = RemoveIndexEntry(*index, old_key, old_record_id);
+            if (!remove_status.ok()) {
+                return mutation.Abort(remove_status);
+            }
+            mutation.AddUndo([this, index_id = index->id, old_key, old_record_id] {
+                const auto found = indexes_by_id_.find(index_id.value());
+                if (found == indexes_by_id_.end()) {
+                    return Status::Error(ErrorCode::kInternal, "rollback index metadata is missing");
+                }
+                return InsertIndexEntry(found->second, old_key, old_record_id);
+            });
+
+            const Status insert_status = InsertIndexEntry(*index, new_key, new_record_id.value());
+            if (!insert_status.ok()) {
+                return mutation.Abort(insert_status);
+            }
+            mutation.AddUndo([this, index_id = index->id, new_key, inserted_record_id = new_record_id.value()] {
+                const auto found = indexes_by_id_.find(index_id.value());
+                if (found == indexes_by_id_.end()) {
+                    return Status::Error(ErrorCode::kInternal, "rollback index metadata is missing");
+                }
+                return RemoveIndexEntry(found->second, new_key, inserted_record_id);
+            });
+        }
+
+        const Status erase_status = heap.Erase(old_record_id);
+        if (!erase_status.ok()) {
+            return mutation.Abort(erase_status);
+        }
+        mutation.AddUndo([table_pages = pages.value(), old_record_id] {
+            TableHeap undo_heap{*table_pages};
+            return undo_heap.Restore(old_record_id);
+        });
+
+#if defined(KERNDB_ENABLE_TEST_HOOKS)
+        // Trigger only after the replacement row is indexed and the original
+        // heap slot is tombstoned, with an undo action registered for each.
+        if (fail_after_next_update_row_for_testing_) {
+            fail_after_next_update_row_for_testing_ = false;
+            return mutation.Abort(Status::Error(
+                ErrorCode::kIo,
+                "injected failure after persistent update row mutation"));
+        }
+#endif
+    }
+
+    mutation.Commit();
+    return static_cast<std::uint64_t>(matches.size());
+}
+
+Result<std::uint64_t> PersistentStorage::DeleteMatching(
+    const InMemoryTable& table,
+    std::size_t predicate_column_index,
+    const Value& predicate_value) {
+    const auto pages = GetTablePages(table.id, false);
+    if (!pages.ok()) {
+        return pages.status();
+    }
+    TableHeap heap{*pages.value()};
+    const auto records = heap.ScanWithRecordIds(table.schema);
+    if (!records.ok()) {
+        return records.status();
+    }
+
+    std::vector<std::pair<RecordId, Tuple>> matches;
+    for (const auto& record : records.value()) {
+        if (ValuesEqual(record.second[predicate_column_index], predicate_value)) {
+            matches.push_back(record);
+        }
+    }
+
+    const std::vector<InMemoryIndex*> indexes = IndexesForTable(table.id);
+    for (const auto& [record_id, tuple] : matches) {
+        for (const InMemoryIndex* index : indexes) {
+            const std::int64_t key = std::get<std::int64_t>(tuple[index->column_index]);
+            const Status verification = VerifyIndexEntry(*index, key, record_id);
+            if (!verification.ok()) {
+                return verification;
+            }
+        }
+    }
+
+    Mutation mutation{transaction_active_ ? &transaction_undo_actions_ : nullptr};
+    for (const auto& [record_id, tuple] : matches) {
+        for (InMemoryIndex* index : indexes) {
+            const std::int64_t key = std::get<std::int64_t>(tuple[index->column_index]);
+            const Status remove_status = RemoveIndexEntry(*index, key, record_id);
+            if (!remove_status.ok()) {
+                return mutation.Abort(remove_status);
+            }
+            mutation.AddUndo([this, index_id = index->id, key, record_id] {
+                const auto found = indexes_by_id_.find(index_id.value());
+                if (found == indexes_by_id_.end()) {
+                    return Status::Error(ErrorCode::kInternal, "rollback index metadata is missing");
+                }
+                return InsertIndexEntry(found->second, key, record_id);
+            });
+        }
+        const Status erase_status = heap.Erase(record_id);
+        if (!erase_status.ok()) {
+            return mutation.Abort(erase_status);
+        }
+        mutation.AddUndo([table_pages = pages.value(), record_id] {
+            TableHeap undo_heap{*table_pages};
+            return undo_heap.Restore(record_id);
+        });
+    }
+
+    mutation.Commit();
+    return static_cast<std::uint64_t>(matches.size());
 }
 
 Result<std::vector<Tuple>> PersistentStorage::Scan(const InMemoryTable& table) const {
@@ -328,6 +607,94 @@ Result<IndexLookup> PersistentStorage::LookupByIndex(
         return IndexLookup{.index_available = true, .tuple = tuple.value()};
     }
     return IndexLookup{.index_available = false, .tuple = std::nullopt};
+}
+
+std::vector<InMemoryIndex*> PersistentStorage::IndexesForTable(TableId table_id) {
+    std::vector<InMemoryIndex*> indexes;
+    for (auto& [unused_id, index] : indexes_by_id_) {
+        static_cast<void>(unused_id);
+        if (index.table_id == table_id) {
+            indexes.push_back(&index);
+        }
+    }
+    return indexes;
+}
+
+Status PersistentStorage::VerifyIndexEntry(
+    const InMemoryIndex& index,
+    std::int64_t key,
+    RecordId record_id) const {
+    const auto index_pages = GetIndexPages(index.id, false);
+    if (!index_pages.ok()) {
+        return index_pages.status();
+    }
+    const auto tree = BPlusTree::Open(*index_pages.value(), index.root_page_id);
+    if (!tree.ok()) {
+        return tree.status();
+    }
+    const auto found = tree.value().Search(key);
+    if (!found.ok()) {
+        return found.status();
+    }
+    if (found.value() != record_id) {
+        return Status::Error(ErrorCode::kCorruption, "index key refers to an unexpected record ID")
+            .WithContext("index", index.name)
+            .WithContext("key", std::to_string(key));
+    }
+    return Status::Ok();
+}
+
+Status PersistentStorage::InsertIndexEntry(
+    InMemoryIndex& index,
+    std::int64_t key,
+    RecordId record_id) {
+    const auto index_pages = GetIndexPages(index.id, false);
+    if (!index_pages.ok()) {
+        return index_pages.status();
+    }
+    auto tree = BPlusTree::Open(*index_pages.value(), index.root_page_id);
+    if (!tree.ok()) {
+        return tree.status();
+    }
+    const auto insert_status = tree.value().Insert(key, record_id);
+    if (!insert_status.ok()) {
+        return insert_status.status();
+    }
+    if (tree.value().root_page_id() == index.root_page_id) {
+        return Status::Ok();
+    }
+
+    InMemoryIndex updated = index;
+    updated.root_page_id = tree.value().root_page_id();
+    const Status persist_status = index_catalog_store_.Append(updated);
+    if (!persist_status.ok()) {
+        return persist_status;
+    }
+    const Status catalog_status = catalog_->UpdateIndexRoot(updated.id, updated.root_page_id);
+    if (!catalog_status.ok()) {
+        return catalog_status;
+    }
+    index = std::move(updated);
+    return Status::Ok();
+}
+
+Status PersistentStorage::RemoveIndexEntry(
+    const InMemoryIndex& index,
+    std::int64_t key,
+    RecordId record_id) const {
+    const auto index_pages = GetIndexPages(index.id, false);
+    if (!index_pages.ok()) {
+        return index_pages.status();
+    }
+    auto tree = BPlusTree::Open(*index_pages.value(), index.root_page_id);
+    if (!tree.ok()) {
+        return tree.status();
+    }
+    const auto remove_status = tree.value().Remove(key, record_id);
+    if (!remove_status.ok()) {
+        return remove_status.status();
+    }
+    return Status::Ok();
 }
 
 PersistentStorage::PersistentStorage(
