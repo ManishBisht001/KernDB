@@ -25,6 +25,8 @@ enum class ErrorCode : std::uint16_t {
     kCorruption,
     kUnsupported,
     kInternal,
+    kDeadlock,
+    kTransactionAborted,
 };
 
 [[nodiscard]] std::string_view ErrorCodeName(ErrorCode code) noexcept;

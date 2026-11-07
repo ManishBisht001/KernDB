@@ -32,6 +32,10 @@ std::string_view ErrorCodeName(ErrorCode code) noexcept {
             return "corruption";
         case ErrorCode::kUnsupported:
             return "unsupported";
+        case ErrorCode::kDeadlock:
+            return "deadlock";
+        case ErrorCode::kTransactionAborted:
+            return "transaction_aborted";
         case ErrorCode::kInternal:
             return "internal";
     }

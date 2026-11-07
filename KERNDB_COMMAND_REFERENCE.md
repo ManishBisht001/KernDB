@@ -67,7 +67,7 @@ KernDB's type system has `INT` (stored as signed 64-bit integer) and `TEXT`. A p
 | `COMMIT` — **SUPPORTED** | `COMMIT;` | Ends the active transaction and discards its undo history. It is rejected when no transaction is active. Committed changes survive an orderly close and reopen. | Parser `AstCommit`; `Database::CommitTransaction`; `PersistentStorage::CommitTransaction`. Test: `PersistentDatabaseCommitsExplicitInsertAndPersistsIt`. |
 | `ROLLBACK` — **SUPPORTED** | `ROLLBACK;` | Ends the active transaction and reverses its successful mutations in reverse order. It is rejected when no transaction is active. Closing the `Database` with a transaction active also rolls it back. | Parser `AstRollback`; `Database::RollbackTransaction` / `RollbackActiveTransaction`; `PersistentStorage::RollbackTransaction`. Tests: `PersistentDatabaseRollsBackExplicitInsertAcrossReopen`, `PersistentDatabaseRollsBackMultipleMutationsInReverseAndRestoresIndexedRid`, `PersistentDatabaseCloseRollsBackActiveTransaction`. |
 
-`BEGIN`, `COMMIT`, and `ROLLBACK` are handled by `Database::Execute` before normal binding and planning. One explicit transaction may be active per `Database` instance. Successful `INSERT`, `UPDATE`, and `DELETE` statements inside it remain undoable until `COMMIT`; `SELECT` sees those writes immediately. If a statement fails, its own partial persistent changes are compensated. When that compensation succeeds, the transaction remains active and can continue. Transactional DDL is unsupported: `CREATE TABLE` and `CREATE INDEX` return an error inside an explicit transaction. Autocommit remains in effect when no transaction is active.
+`BEGIN`, `COMMIT`, and `ROLLBACK` are handled by `Database::Execute` before normal binding and planning. One explicit transaction may be active per `Database` session. Distinct `Database::Open` sessions for the same normalized persistent directory share a runtime and can execute concurrently in one process; calls through one session are serialized. Successful `INSERT`, `UPDATE`, and `DELETE` statements inside an explicit transaction remain undoable until `COMMIT`; `SELECT` sees those writes immediately. Catalog and table S/X locks are held until commit or abort. If a statement fails, its own partial persistent changes are compensated. When that compensation succeeds, the transaction remains active and can continue. Transactional DDL is unsupported: `CREATE TABLE` and `CREATE INDEX` return an error inside an explicit transaction. Autocommit remains in effect when no transaction is active.
 
 ### Checklist of requested SQL features
 
@@ -80,7 +80,7 @@ KernDB's type system has `INT` (stored as signed 64-bit integer) and `TEXT`. A p
 | `CREATE INDEX` | **PARTIAL** | Unique B+ tree for one `INT` column in persistent mode. |
 | `UPDATE` | **PARTIAL** | One `SET column = literal`, mandatory single equality `WHERE`. |
 | `DELETE` | **PARTIAL** | Mandatory single equality `WHERE`. |
-| `BEGIN`, `COMMIT`, `ROLLBACK` | **SUPPORTED** | Single-threaded explicit transaction for one `Database`; no nesting. `COMMIT` and `ROLLBACK` require an active transaction. |
+| `BEGIN`, `COMMIT`, `ROLLBACK` | **SUPPORTED** | One explicit transaction per `Database` session; separate persistent sessions for the same directory can run concurrently within one process. No nesting. `COMMIT` and `ROLLBACK` require an active transaction. |
 | Transactional DDL | **NOT SUPPORTED** | `CREATE TABLE` and `CREATE INDEX` are rejected while a transaction is active. |
 | `DROP TABLE` | **NOT SUPPORTED** | No drop statement in token, AST, or parser. |
 | `DROP INDEX` | **NOT SUPPORTED** | No drop statement in token, AST, or parser. |
@@ -158,6 +158,14 @@ For an update, the heap replacement row is inserted first, each index's old key/
 
 The default in-memory `Database()` backend does not use persistent heap/index mutation actions. At `BEGIN`, it copies the `InMemoryCatalog`; successful writes are visible through that catalog to later statements in the transaction, and rollback restores the saved catalog snapshot. `COMMIT` drops the snapshot. On either backend, a statement error whose compensation succeeds leaves an explicit transaction active. A compensation failure can prevent full restoration and is reported as an internal rollback error.
 
+### Concurrency and transaction locks
+
+Each persistent `Database::Open` session has its own active transaction context, with at most one explicit transaction per session. Opening the same normalized database path in one process shares its catalog, persistent storage, transaction manager, and lock manager. Transaction IDs are unique across runtimes in that process. The default in-memory `Database()` creates a private runtime and does not share state with other in-memory instances.
+
+`LockManager` protects the catalog and whole tables with S/X locks. `SELECT` requests table S; `INSERT`, `UPDATE`, `DELETE`, and `CREATE INDEX` request table X. Ordinary statements request catalog S; DDL requests catalog X. All locks are retained through commit or abort, including read locks, which is a rigorous form of strict 2PL. The compatibility rule is S/S compatible; every combination involving X conflicts. These coarse locks protect records and index mappings through the SQL API, but do not provide row-level concurrency.
+
+When a request blocks, the lock manager rebuilds a wait-for graph from live holders and queued requests. The requesting transaction is aborted if the request creates a cycle. `Database` rolls back its persistent mutation history, marks it aborted, releases its locks, and wakes waiters. The persistent storage mutex still serializes physical writes across tables, and the buffer-pool manager mutex remains held across synchronous page reads and flushes. Coordination is process-local; separate processes opening the same directory are not protected. See [`docs/CONCURRENCY_PHASE6.md`](docs/CONCURRENCY_PHASE6.md) for lock ordering, thread-safety scope, and limitations.
+
 ### Duplicate keys and removal
 
 An index is unique: each integer key maps to at most one RID. Duplicate inserts fail with an `already_exists` error. Creating an index on a column with existing duplicate values also fails while the tree is populated. A table can have indexes on different columns, but `InMemoryCatalog::CreateIndex` rejects a second index on the same column.
@@ -185,7 +193,8 @@ The phase names come from `IMPLEMENTATION_PLAN.md` and the phase-specific docume
 | 2 — Durable paged heap | Database metadata, fixed-size checksum-protected pages, disk/page managers, slotted-page heap records, persisted table catalog, and reopen. | **Implemented for orderly clean reopen.** See `src/storage/{database_metadata,disk_manager,page,page_manager,heap,catalog_store,record,persistent_storage}.cpp` and `PersistentDatabaseRetainsMultipleRowsAndPhaseOneSemanticsAfterRestart`. No crash-safe durability. |
 | 3 — Buffer pool | Bounded cache (16 frames by default), pin guards, dirty-page writes, LRU selection among unpinned pages, flush and telemetry paths. | **Implemented.** See `src/storage/buffer_pool.cpp` and `tests/unit/storage/buffer_pool_test.cpp`, including `BufferPoolEvictsTheLeastRecentlyUnpinnedFrame` and `BufferPoolPersistsDirtyPagesAcrossAnOrderlyRestart`. |
 | 4 — B+ tree and simple planning | Persistent unique `INT` indexes, index catalog, leaf/internal pages, equality lookup, leaf/internal splits, root metadata updates, and sequential fallback. | **Implemented for equality lookup.** There is no SQL range scan, cost-based optimizer, statistics-driven plan selection, or `EXPLAIN`. See `src/storage/bplus_tree.cpp`, `src/storage/index_catalog_store.cpp`, `src/planner/planner.cpp`, and the B+ tree/integration tests. |
-| 5 — Mutation / transactions | Persistent and in-memory `INSERT`, `UPDATE`, and `DELETE`; statement compensation; explicit `BEGIN`/`COMMIT`/`ROLLBACK`; persistent reverse-action history and in-memory catalog snapshots; transaction-local read visibility; DDL rejection; close-time rollback. | **IMPLEMENTED for the documented single-threaded, normal-execution and clean-shutdown scope.** Evidence includes `PersistentStorageRollsBackAnUpdateAfterHeapAndIndexChanges`, `PersistentDatabaseCommitsExplicitInsertAndPersistsIt`, `PersistentDatabaseRollsBackExplicitInsertAcrossReopen`, `PersistentDatabaseRollsBackMultipleMutationsInReverseAndRestoresIndexedRid`, `PersistentDatabaseKeepsFailedStatementAtomicAndTransactionActive`, `PersistentDatabaseCloseRollsBackActiveTransaction`, and `InMemoryDatabaseSupportsExplicitTransactionRollback`. See `docs/MUTATIONS_PHASE5.md`, `src/database.cpp`, `src/storage/persistent_storage.cpp`, and the Phase 5 integration tests. WAL, crash recovery, and concurrent transactions remain unsupported. |
+| 5 — Mutation / transactions | Persistent and in-memory `INSERT`, `UPDATE`, and `DELETE`; statement compensation; explicit `BEGIN`/`COMMIT`/`ROLLBACK`; persistent reverse-action history and in-memory catalog snapshots; transaction-local read visibility; DDL rejection; close-time rollback. | **IMPLEMENTED.** Evidence includes `PersistentStorageRollsBackAnUpdateAfterHeapAndIndexChanges`, `PersistentDatabaseCommitsExplicitInsertAndPersistsIt`, `PersistentDatabaseRollsBackExplicitInsertAcrossReopen`, `PersistentDatabaseRollsBackMultipleMutationsInReverseAndRestoresIndexedRid`, `PersistentDatabaseKeepsFailedStatementAtomicAndTransactionActive`, `PersistentDatabaseCloseRollsBackActiveTransaction`, and `InMemoryDatabaseSupportsExplicitTransactionRollback`. See `docs/MUTATIONS_PHASE5.md`, `src/database.cpp`, `src/storage/persistent_storage.cpp`, and the Phase 5 integration tests. Phase 6 supplies concurrency control; WAL, crash recovery, and crash-safe durability remain unsupported. |
+| 6 — Concurrency and strict 2PL | Same-process persistent sessions; independent transaction IDs and lifecycle; catalog/table S/X locks retained to completion; deadlock detection and victim rollback; synchronized persistent storage, buffer pool, and B+ tree access. | **IMPLEMENTED for the documented process-local, table-lock scope.** Evidence includes the `PersistentSessions...` integration tests, four `LockManager...` unit tests, `TransactionManagerCreatesUniqueContextsAndTracksTerminalStates`, `BufferPoolSerializesConcurrentPageGuardAccess`, and `BPlusTreeSupportsConcurrentInsertionsAndLookups`. See `docs/CONCURRENCY_PHASE6.md`, `src/concurrency/lock_manager.cpp`, `src/transaction/transaction_manager.cpp`, and `src/database.cpp`. Cross-process coordination, row locks, MVCC, WAL, and crash recovery are unsupported. |
 
 There is no separate B+ tree source module directory: the implementation is currently under `src/storage`. Also, `docs/DEVELOPMENT.md` and some Phase 1/2 notes describe earlier snapshots of the engine; later Phase 3/4/5 code and the current parser/tests establish the broader implementation described here.
 
@@ -247,29 +256,33 @@ CLI or C++ caller
 20. **Does data survive restarting the program?** — Persistent committed changes and completed rollbacks survive an orderly close and reopen with `--database DIRECTORY`. Closing with a transaction active rolls it back. The default REPL is in memory and loses data at exit.
 21. **Is persistence crash-safe?** — No. There is no WAL or recovery code, and writes may reach disk before `COMMIT`; no crash-safe transactional durability is promised.
 22. **How are `UPDATE` and `DELETE` implemented?** — They support one equality condition. Persistent updates write a replacement row, retarget indexes to its new RID, and tombstone the old slot; deletes remove index entries and tombstone matched slots.
-23. **What does transaction support cover?** — One single-threaded explicit transaction per `Database`, using `BEGIN`, `COMMIT`, and `ROLLBACK`. `INSERT`, `UPDATE`, and `DELETE` are undoable until commit, and `SELECT` sees those writes.
+23. **What does transaction support cover?** — One explicit transaction per `Database` session. Separate persistent sessions for the same directory can execute concurrently in one process; `INSERT`, `UPDATE`, and `DELETE` are undoable until commit, and `SELECT` sees the session's successful writes.
 24. **How does persistent rollback restore an update?** — It reverses storage actions: restore the old heap slot, remove the new key/RID, restore the old key/RID, and tombstone the replacement row. This preserves the original RID mapping.
 25. **How does the in-memory backend roll back?** — It copies the `InMemoryCatalog` at `BEGIN` and restores that snapshot on `ROLLBACK`.
 26. **What happens after a statement error inside a transaction?** — Its partial persistent changes are compensated. If that succeeds, the transaction stays active and later statements may continue; a compensation failure is reported as an internal rollback error.
 27. **Are nested transactions or transactional DDL supported?** — No. Nested `BEGIN` is rejected; `COMMIT`/`ROLLBACK` without an active transaction are rejected; `CREATE TABLE` and `CREATE INDEX` are rejected inside a transaction.
 28. **What does closing with an active transaction do?** — `Database` attempts rollback before storage closes. This is a clean-shutdown behavior, not crash recovery.
-29. **Does Phase 5 mean transaction support is finished?** — The planned Phase 5 scope is implemented for single-threaded normal execution and orderly shutdown. Concurrent transactions, locking, MVCC, WAL, and crash recovery remain **NOT SUPPORTED**.
-30. **Which common SQL features are still missing?** — Joins, `ORDER BY`, `GROUP BY`, `LIMIT`, `DISTINCT`, aggregates, `NULL`, non-equality comparisons, and compound boolean conditions are **NOT SUPPORTED**.
+29. **How does Phase 6 coordinate concurrent sessions?** — Catalog and table S/X locks are retained until commit or abort. Reads use S, writes use X, and deadlock detection aborts the requesting transaction that closes a cycle.
+30. **What does Phase 6 not provide?** — It does not coordinate separate processes, provide row-level locks or MVCC, or implement WAL, crash recovery, or crash-safe transactional durability.
+31. **Does Phase 5/6 make persistence crash-safe?** — No. Commit and rollback persist across clean close/reopen, but there is no WAL or recovery code and writes may reach disk before commit.
+32. **Which common SQL features are still missing?** — Joins, `ORDER BY`, `GROUP BY`, `LIMIT`, `DISTINCT`, aggregates, `NULL`, non-equality comparisons, and compound boolean conditions are **NOT SUPPORTED**.
 
 ## 7. Limitations
 
-- Transaction handling is synchronous and single-threaded, with at most one active explicit transaction per `Database` instance. There are no concurrent transactions, locks, or MVCC.
+- Each `Database` session has at most one active explicit transaction; its calls are serialized. Separate persistent sessions opened on the same normalized directory can run concurrently within one process.
+- Locks are catalog/table-level S/X locks held until transaction completion. There are no row/key locks. Persistent storage serializes physical mutations across tables, and separate processes do not coordinate.
 - Nested transactions and savepoints are unsupported. `COMMIT` and `ROLLBACK` require an active transaction.
 - `CREATE TABLE` and `CREATE INDEX` are rejected inside explicit transactions; transactional DDL is not implemented.
 - **Statement atomicity:** a failed persistent mutation compensates its completed steps before returning. If compensation itself encounters a storage error, complete restoration is not guaranteed; the error is reported and an explicit transaction remains available for a rollback attempt.
-- **Explicit transaction atomicity:** during normal single-threaded execution, `ROLLBACK` reverses all successful mutations and closing with an active transaction rolls it back. This does not make the transaction crash-atomic.
+- **Explicit transaction atomicity:** during normal execution through `Database`, `ROLLBACK` reverses successful mutations and closing a session with an active transaction rolls it back. Concurrent sessions are isolated by rigorous table-level 2PL. This does not make the transaction crash-atomic.
+- **Rollback storage errors:** if transaction-level or deadlock-victim undo encounters a storage error, KernDB reports it but currently retires the transaction and releases its locks; full restoration is not guaranteed. This error path has no failure-injection test.
 - **Clean-shutdown persistence:** committed state and completed rollback state survive an orderly close and reopen.
 - **Crash recovery and durability:** there is no WAL, recovery, or crash-safe transactional durability. A crash during an active transaction can leave uncommitted or partial state because page writes can reach disk before commit.
 - Existing SQL limits still apply: one-row `INSERT`, one-column assignment per `UPDATE`, equality predicates only, unique `INT` indexes, and no joins, expressions, aggregates, range predicates, or `NULL`.
 
 ## 8. Verification
 
-I inspected the current source paths listed above and cross-checked the Phase 5 documents and tests. This update edits only this reference document; existing uncommitted source and test changes in the checkout were left intact.
+This reference reflects the current source, Phase 5 and Phase 6 documentation, and the full test output recorded below.
 
 Commands run from the project root:
 
@@ -283,7 +296,7 @@ Result: configure and generate succeeded; build files were written to `build/deb
 cmake --build --preset debug
 ```
 
-Result: `ninja: no work to do.`
+Result: succeeded; rebuilt `persistent_storage.cpp`, linked `libkerndb.a`, `kerndb_shell.exe`, and `kerndb_phase2_tests.exe`.
 
 ```text
 ctest --preset debug
@@ -295,7 +308,17 @@ Result: **3/3 CTest tests passed**: `kerndb.phase2.unit_and_integration`, `kernd
 .\build\debug\tests\kerndb_phase2_tests.exe
 ```
 
-Result: **78/78 unified unit and integration tests passed**, including the Phase 5 rollback, transaction lifecycle, clean reopen, statement-error, and close-time rollback tests.
+Result: **89/89 unified unit and integration tests passed** on the first direct run. The direct executable was then run twice more; both repeats also passed **89/89**. This includes the Phase 5 transaction regressions, Phase 6 concurrency tests, and shell smoke tests.
+
+ThreadSanitizer availability probe:
+
+```text
+$probePath = Join-Path $env:TEMP 'kerndb_phase6_tsan_probe.exe'
+$source = 'int main() { return 0; }'
+$source | & 'C:\msys64\ucrt64\bin\g++.exe' -x c++ -std=c++20 -fsanitize=thread -o $probePath -
+```
+
+Result: unavailable with the configured MSYS2 UCRT64 GCC. The linker reported `cannot find -ltsan`. A WSL availability check returned `Wsl/Service/E_ACCESSDENIED`; the repository's `sanitize` preset is for AddressSanitizer and UndefinedBehaviorSanitizer on Linux/WSL.
 
 ## Source and test index
 
@@ -309,3 +332,4 @@ Result: **78/78 unified unit and integration tests passed**, including the Phase
 | Buffer pool and pages | `src/storage/buffer_pool.cpp`, `src/storage/page_manager.cpp`, `src/storage/page.cpp`, `src/storage/disk_manager.cpp` | `BufferPoolEvictsTheLeastRecentlyUnpinnedFrame`, `BufferPoolPersistsDirtyPagesAcrossAnOrderlyRestart` |
 | B+ tree/index catalog | `src/storage/bplus_tree.cpp`, `src/storage/index_catalog_store.cpp`, `src/storage/persistent_storage.cpp` | `BPlusTreeMaintainsSortedEntriesAcrossLeafAndInternalSplits`, `BPlusTreePersistsRootLeavesAndEntriesAcrossReopen`, `PersistentDatabaseIndexesExistingRowsAcrossSplitsAndRestart` |
 | Persistent SQL and Phase 5 transactions | `src/database.cpp`, `src/storage/persistent_storage.cpp`, `docs/MUTATIONS_PHASE5.md` | `PersistentDatabaseUpdatesRowsAndMaintainsUniqueIndexes`, `PersistentDatabaseDeletesRowsMaintainsIndexesAndReusesKeys`, `PersistentStorageRollsBackAnUpdateAfterHeapAndIndexChanges`, `PersistentDatabaseCommitsExplicitInsertAndPersistsIt`, `PersistentDatabaseRollsBackMultipleMutationsInReverseAndRestoresIndexedRid`, `PersistentDatabaseKeepsFailedStatementAtomicAndTransactionActive`, `PersistentDatabaseCloseRollsBackActiveTransaction`, `InMemoryDatabaseSupportsExplicitTransactionRollback` |
+| Concurrency and Phase 6 transactions | `include/kerndb/concurrency/lock_manager.h`, `src/concurrency/lock_manager.cpp`, `include/kerndb/transaction/transaction_manager.h`, `src/transaction/transaction_manager.cpp`, `src/database.cpp`, `docs/CONCURRENCY_PHASE6.md` | Four `LockManager...` tests, `TransactionManagerCreatesUniqueContextsAndTracksTerminalStates`, `BufferPoolSerializesConcurrentPageGuardAccess`, `BPlusTreeSupportsConcurrentInsertionsAndLookups`, `PersistentSessionsBlockConflictingWritesAndCommitIndependentTransactions`, `PersistentSessionsAllowConcurrentReadsAndBlockReadWriteConflicts`, `PersistentSessionsDetectDeadlockRollbackVictimAndWakeSurvivor` |

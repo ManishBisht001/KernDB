@@ -33,3 +33,10 @@ KERNDB_TEST(ResultStoresValuesAndErrors) {
     const kerndb::Result<void> successful_void_result;
     KERNDB_EXPECT(successful_void_result.ok());
 }
+
+KERNDB_TEST(StatusNamesDeadlockAndAbortedTransactionErrors) {
+    KERNDB_EXPECT_EQ(std::string_view("deadlock"), kerndb::ErrorCodeName(kerndb::ErrorCode::kDeadlock));
+    KERNDB_EXPECT_EQ(
+        std::string_view("transaction_aborted"),
+        kerndb::ErrorCodeName(kerndb::ErrorCode::kTransactionAborted));
+}

@@ -1,9 +1,11 @@
 # KernDB Phase 5: Mutations and Single-Threaded Transactions
 
-Phase 5 supports persistent `INSERT`, `UPDATE`, and `DELETE`, unique `INT`
-B+ tree index maintenance, statement-level compensation, and one explicit
-transaction at a time per `Database` instance. It is synchronous and
-single-threaded.
+Phase 5 established persistent `INSERT`, `UPDATE`, and `DELETE`, unique `INT`
+B+ tree index maintenance, statement-level compensation, and explicit
+transactions. Phase 6 adds concurrent persistent sessions using strict 2PL;
+this document describes the mutation and rollback behavior that Phase 6
+continues to use. Each `Database` session still permits at most one explicit
+transaction.
 
 ## Supported SQL
 
@@ -67,20 +69,24 @@ index key-to-RID mappings. The in-memory `Database()` backend uses a catalog
 snapshot for explicit rollback because it has no persistent storage mutation
 context.
 
-Closing a `Database` with an active transaction performs a rollback before its
-storage closes. The persistent storage destructor also rolls back an active
-transaction when used directly. Normal commit changes already flow through the
+Closing a `Database` session with an active transaction performs a rollback
+before that session releases its shared runtime. The persistent storage
+destructor also rolls back any remaining transaction histories when the final
+session releases the runtime. Normal commit changes already flow through the
 existing `PageManager` and `BufferPoolManager`, so a committed transaction
 survives a clean close and reopen. Rollback is also written through those
-layers before close.
+layers before close. See `docs/CONCURRENCY_PHASE6.md` for same-process session
+coordination and lock behavior.
 
 ## Atomicity and durability boundaries
 
 - **Statement atomicity:** the current statement's completed heap/index steps
   are compensated on a reported operation failure.
-- **Explicit transaction atomicity:** during normal single-threaded execution,
-  successful mutations are undone as a group by `ROLLBACK` or close-time
-  rollback; `COMMIT` retains their page changes.
+- **Explicit transaction atomicity:** during normal execution through the
+  `Database` API, successful mutations are undone as a group by `ROLLBACK` or
+  close-time rollback; `COMMIT` retains their page changes. Phase 6 holds
+  catalog/table locks until transaction completion when sessions run
+  concurrently.
 - **Clean-shutdown persistence:** committed state and completed rollback state
   survive an orderly close/reopen.
 - **Crash recovery:** unsupported. There is no WAL or recovery protocol, and
@@ -91,9 +97,14 @@ layers before close.
 ## Current limitations
 
 - One active transaction per `Database`; no nested transactions or savepoints.
+- Persistent sessions opened on the same normalized path coordinate only
+  within one process. Locking is table-level, and persistent mutations are
+  serialized by the shared storage mutex.
 - `CREATE TABLE` and `CREATE INDEX` are not allowed inside a transaction.
 - One `SET column = literal` assignment per `UPDATE`; no expressions or joins.
 - Equality `WHERE` predicates only; no range mutation or range index scans.
 - Unique `INT` indexes only; `TEXT` indexes are unsupported.
 - No heap-page compaction or RID reuse after deletion.
-- No concurrent transactions, locking, MVCC, WAL, or crash recovery.
+- No row/key-level locking, cross-process coordination, MVCC, WAL, or crash
+  recovery. See `docs/CONCURRENCY_PHASE6.md` for the implemented concurrency
+  boundary.

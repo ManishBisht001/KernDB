@@ -4,6 +4,7 @@
 #include <functional>
 #include <iterator>
 #include <memory>
+#include <shared_mutex>
 #include <set>
 #include <string>
 #include <utility>
@@ -38,10 +39,10 @@ namespace {
     return Status::Ok();
 }
 
-// This is deliberately a small, single-threaded logical mutation context. It
-// records compensating actions after each completed storage change. It is not
-// a WAL and makes no crash-recovery claim, but it keeps failed API mutations
-// from exposing partial heap/index changes during the current process.
+// This is a small logical mutation context. PersistentStorage serializes each
+// context while it records compensating actions after completed storage
+// changes. It is not a WAL and makes no crash-recovery claim, but it keeps
+// failed API mutations from exposing partial heap/index changes in-process.
 using UndoActions = std::vector<std::function<Status()>>;
 
 [[nodiscard]] Status RollbackActions(UndoActions& undo_actions) {
@@ -110,42 +111,73 @@ private:
 }  // namespace
 
 #if defined(KERNDB_ENABLE_TEST_HOOKS)
-void PersistentStorage::FailNextUpdateAfterRowMutationForTesting() noexcept {
+void PersistentStorage::FailNextUpdateAfterRowMutationForTesting() {
+    std::scoped_lock lock(mutex_);
     fail_after_next_update_row_for_testing_ = true;
 }
 #endif
 
 PersistentStorage::~PersistentStorage() {
-    if (transaction_active_) {
-        static_cast<void>(RollbackTransaction());
-    }
-}
-
-Status PersistentStorage::BeginTransaction() {
-    if (transaction_active_) {
-        return Status::Error(ErrorCode::kInvalidArgument, "a transaction is already active");
+    std::scoped_lock lock(mutex_);
+    for (auto& [transaction_id, undo_actions] : transaction_undo_actions_) {
+        static_cast<void>(transaction_id);
+        static_cast<void>(RollbackActions(undo_actions));
     }
     transaction_undo_actions_.clear();
-    transaction_active_ = true;
+}
+
+Status PersistentStorage::BeginTransaction(TransactionId transaction_id) {
+    std::scoped_lock lock(mutex_);
+    if (!transaction_id.valid()) {
+        return Status::Error(ErrorCode::kInvalidArgument, "transaction ID is invalid");
+    }
+    if (!transaction_undo_actions_.emplace(transaction_id.value(), UndoActions{}).second) {
+        return Status::Error(ErrorCode::kInvalidArgument, "transaction already has persistent storage state")
+            .WithContext("transaction_id", ToString(transaction_id));
+    }
     return Status::Ok();
 }
 
-Status PersistentStorage::CommitTransaction() {
-    if (!transaction_active_) {
-        return Status::Error(ErrorCode::kInvalidArgument, "there is no active transaction to commit");
+Status PersistentStorage::CommitTransaction(TransactionId transaction_id) {
+    std::scoped_lock lock(mutex_);
+    const auto found = transaction_undo_actions_.find(transaction_id.value());
+    if (found == transaction_undo_actions_.end()) {
+        return Status::Error(ErrorCode::kInvalidArgument, "there is no active storage transaction to commit")
+            .WithContext("transaction_id", ToString(transaction_id));
     }
-    transaction_undo_actions_.clear();
-    transaction_active_ = false;
+    transaction_undo_actions_.erase(found);
     return Status::Ok();
 }
 
-Status PersistentStorage::RollbackTransaction() {
-    if (!transaction_active_) {
-        return Status::Error(ErrorCode::kInvalidArgument, "there is no active transaction to roll back");
+Status PersistentStorage::RollbackTransaction(TransactionId transaction_id) {
+    std::scoped_lock lock(mutex_);
+    const auto found = transaction_undo_actions_.find(transaction_id.value());
+    if (found == transaction_undo_actions_.end()) {
+        return Status::Error(ErrorCode::kInvalidArgument, "there is no active storage transaction to roll back")
+            .WithContext("transaction_id", ToString(transaction_id));
     }
-    const Status rollback_status = RollbackActions(transaction_undo_actions_);
-    transaction_active_ = false;
+    const Status rollback_status = RollbackActions(found->second);
+    transaction_undo_actions_.erase(found);
     return rollback_status;
+}
+
+Result<PersistentStorage::UndoActions*> PersistentStorage::ResolveUndoActions(
+    std::optional<TransactionId> transaction_id) {
+    constexpr TransactionId kLegacyTransactionId{0U};
+    if (transaction_id.has_value()) {
+        if (!transaction_id->valid()) {
+            return Status::Error(ErrorCode::kInvalidArgument, "transaction ID is invalid");
+        }
+        const auto found = transaction_undo_actions_.find(transaction_id->value());
+        if (found == transaction_undo_actions_.end()) {
+            return Status::Error(ErrorCode::kInvalidArgument, "mutation transaction is not active")
+                .WithContext("transaction_id", ToString(*transaction_id));
+        }
+        return &found->second;
+    }
+
+    const auto legacy = transaction_undo_actions_.find(kLegacyTransactionId.value());
+    return legacy == transaction_undo_actions_.end() ? nullptr : &legacy->second;
 }
 
 Result<std::unique_ptr<PersistentStorage>> PersistentStorage::Open(
@@ -236,6 +268,7 @@ Result<std::unique_ptr<PersistentStorage>> PersistentStorage::Open(
 }
 
 Result<void> PersistentStorage::CreateTable(const InMemoryTable& table) {
+    std::scoped_lock lock(mutex_);
     const std::filesystem::path table_path = TablePath(table.id);
     std::error_code error;
     if (std::filesystem::exists(table_path, error)) {
@@ -263,7 +296,11 @@ Result<void> PersistentStorage::CreateTable(const InMemoryTable& table) {
     return Result<void>{};
 }
 
-Result<RecordId> PersistentStorage::Insert(const InMemoryTable& table, const Tuple& tuple) {
+Result<RecordId> PersistentStorage::Insert(
+    const InMemoryTable& table,
+    const Tuple& tuple,
+    std::optional<TransactionId> transaction_id) {
+    std::scoped_lock lock(mutex_);
     const auto pages = GetTablePages(table.id, false);
     if (!pages.ok()) {
         return pages.status();
@@ -292,7 +329,11 @@ Result<RecordId> PersistentStorage::Insert(const InMemoryTable& table, const Tup
         }
     }
 
-    Mutation mutation{transaction_active_ ? &transaction_undo_actions_ : nullptr};
+    const auto undo_actions = ResolveUndoActions(transaction_id);
+    if (!undo_actions.ok()) {
+        return undo_actions.status();
+    }
+    Mutation mutation{undo_actions.value()};
     const auto record_id = heap.Insert(table.schema, tuple);
     if (!record_id.ok()) {
         return record_id.status();
@@ -326,7 +367,9 @@ Result<std::uint64_t> PersistentStorage::UpdateMatching(
     std::size_t column_index,
     const Value& value,
     std::size_t predicate_column_index,
-    const Value& predicate_value) {
+    const Value& predicate_value,
+    std::optional<TransactionId> transaction_id) {
+    std::scoped_lock lock(mutex_);
     const auto pages = GetTablePages(table.id, false);
     if (!pages.ok()) {
         return pages.status();
@@ -372,7 +415,11 @@ Result<std::uint64_t> PersistentStorage::UpdateMatching(
         }
     }
 
-    Mutation mutation{transaction_active_ ? &transaction_undo_actions_ : nullptr};
+    const auto undo_actions = ResolveUndoActions(transaction_id);
+    if (!undo_actions.ok()) {
+        return undo_actions.status();
+    }
+    Mutation mutation{undo_actions.value()};
     for (const auto& [old_record_id, original_tuple] : matches) {
         Tuple replacement = original_tuple;
         replacement[column_index] = value;
@@ -441,7 +488,9 @@ Result<std::uint64_t> PersistentStorage::UpdateMatching(
 Result<std::uint64_t> PersistentStorage::DeleteMatching(
     const InMemoryTable& table,
     std::size_t predicate_column_index,
-    const Value& predicate_value) {
+    const Value& predicate_value,
+    std::optional<TransactionId> transaction_id) {
+    std::scoped_lock lock(mutex_);
     const auto pages = GetTablePages(table.id, false);
     if (!pages.ok()) {
         return pages.status();
@@ -470,7 +519,11 @@ Result<std::uint64_t> PersistentStorage::DeleteMatching(
         }
     }
 
-    Mutation mutation{transaction_active_ ? &transaction_undo_actions_ : nullptr};
+    const auto undo_actions = ResolveUndoActions(transaction_id);
+    if (!undo_actions.ok()) {
+        return undo_actions.status();
+    }
+    Mutation mutation{undo_actions.value()};
     for (const auto& [record_id, tuple] : matches) {
         for (InMemoryIndex* index : indexes) {
             const std::int64_t key = std::get<std::int64_t>(tuple[index->column_index]);
@@ -501,6 +554,7 @@ Result<std::uint64_t> PersistentStorage::DeleteMatching(
 }
 
 Result<std::vector<Tuple>> PersistentStorage::Scan(const InMemoryTable& table) const {
+    std::shared_lock lock(mutex_);
     const auto pages = GetTablePages(table.id, false);
     if (!pages.ok()) {
         return pages.status();
@@ -510,6 +564,7 @@ Result<std::vector<Tuple>> PersistentStorage::Scan(const InMemoryTable& table) c
 }
 
 Result<PageId> PersistentStorage::CreateIndex(const InMemoryIndex& index) {
+    std::scoped_lock lock(mutex_);
     if (!index.id.valid() || index.root_page_id.valid()) {
         return Status::Error(ErrorCode::kInvalidArgument, "new index metadata is invalid");
     }
@@ -575,6 +630,7 @@ Result<IndexLookup> PersistentStorage::LookupByIndex(
     const InMemoryTable& table,
     std::size_t column_index,
     std::int64_t key) const {
+    std::shared_lock lock(mutex_);
     for (const auto& [unused_id, index] : indexes_by_id_) {
         static_cast<void>(unused_id);
         if (index.table_id != table.id || index.column_index != column_index) {
@@ -718,6 +774,7 @@ std::filesystem::path PersistentStorage::IndexPath(IndexId index_id) const {
 Result<PageManager*> PersistentStorage::GetTablePages(
     TableId table_id,
     bool create_if_missing) const {
+    std::scoped_lock cache_lock(page_cache_mutex_);
     const auto existing = table_pages_.find(table_id.value());
     if (existing != table_pages_.end()) {
         return existing->second.get();
@@ -737,6 +794,7 @@ Result<PageManager*> PersistentStorage::GetTablePages(
 Result<PageManager*> PersistentStorage::GetIndexPages(
     IndexId index_id,
     bool create_if_missing) const {
+    std::scoped_lock cache_lock(page_cache_mutex_);
     const auto existing = index_pages_.find(index_id.value());
     if (existing != index_pages_.end()) {
         return existing->second.get();

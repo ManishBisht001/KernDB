@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <mutex>
 #include <span>
 #include <string>
 #include <utility>
@@ -299,6 +300,7 @@ Result<BPlusTree> BPlusTree::Open(PageManager& page_manager, PageId root_page_id
 }
 
 Result<void> BPlusTree::Insert(std::int64_t key, RecordId record_id) {
+    std::unique_lock tree_lock(*latch_);
     if (!record_id.valid()) {
         return TreeError(ErrorCode::kInvalidArgument, "cannot index an invalid record ID");
     }
@@ -362,6 +364,7 @@ Result<void> BPlusTree::Insert(std::int64_t key, RecordId record_id) {
 }
 
 Result<void> BPlusTree::Remove(std::int64_t key, RecordId record_id) {
+    std::unique_lock tree_lock(*latch_);
     if (!record_id.valid()) {
         return TreeError(ErrorCode::kInvalidArgument, "cannot remove an invalid record ID");
     }
@@ -405,6 +408,7 @@ Result<void> BPlusTree::Remove(std::int64_t key, RecordId record_id) {
 }
 
 Result<RecordId> BPlusTree::Search(std::int64_t key) const {
+    std::shared_lock tree_lock(*latch_);
     PageId current_page_id = root_page_id_;
     while (true) {
         const auto read_node = ReadNode(current_page_id);
@@ -434,6 +438,7 @@ Result<RecordId> BPlusTree::Search(std::int64_t key) const {
 }
 
 Result<std::vector<BPlusTreeEntry>> BPlusTree::ScanAll() const {
+    std::shared_lock tree_lock(*latch_);
     PageId current_page_id = root_page_id_;
     while (true) {
         const auto read_node = ReadNode(current_page_id);
@@ -469,7 +474,8 @@ Result<std::vector<BPlusTreeEntry>> BPlusTree::ScanAll() const {
     return entries;
 }
 
-PageId BPlusTree::root_page_id() const noexcept {
+PageId BPlusTree::root_page_id() const {
+    std::shared_lock tree_lock(*latch_);
     return root_page_id_;
 }
 

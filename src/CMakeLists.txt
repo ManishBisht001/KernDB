@@ -4,6 +4,7 @@ add_library(kerndb STATIC
     catalog/catalog.cpp
     common/byte_codec.cpp
     common/result.cpp
+    concurrency/lock_manager.cpp
     execution/executor.cpp
     observability/telemetry.cpp
     parser/lexer.cpp
@@ -21,6 +22,7 @@ add_library(kerndb STATIC
     storage/persistent_storage.cpp
     storage/record.cpp
     types/types.cpp
+    transaction/transaction_manager.cpp
 )
 
 add_library(KernDB::kerndb ALIAS kerndb)

@@ -124,7 +124,10 @@ namespace {
         return table.status();
     }
     if (context.table_storage != nullptr) {
-        const auto record_id = context.table_storage->Insert(*table.value(), plan.values);
+        const auto record_id = context.table_storage->Insert(
+            *table.value(),
+            plan.values,
+            context.transaction_id);
         if (!record_id.ok()) {
             return record_id.status();
         }
@@ -163,7 +166,8 @@ namespace {
             plan.column_index,
             plan.value,
             plan.predicate.column_index,
-            plan.predicate.literal);
+            plan.predicate.literal,
+            context.transaction_id);
         if (!updated.ok()) {
             return updated.status();
         }
@@ -207,7 +211,8 @@ namespace {
         const auto deleted = context.table_storage->DeleteMatching(
             *table.value(),
             plan.predicate.column_index,
-            plan.predicate.literal);
+            plan.predicate.literal,
+            context.transaction_id);
         if (!deleted.ok()) {
             return deleted.status();
         }

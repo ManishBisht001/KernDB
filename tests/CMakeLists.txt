@@ -5,6 +5,8 @@ add_executable(kerndb_phase2_tests
     unit/common/byte_codec_test.cpp
     unit/common/ids_test.cpp
     unit/common/result_test.cpp
+    unit/concurrency/lock_manager_test.cpp
+    unit/concurrency/storage_concurrency_test.cpp
     unit/observability/telemetry_test.cpp
     unit/execution/executor_test.cpp
     unit/parser/lexer_test.cpp
@@ -20,7 +22,9 @@ add_executable(kerndb_phase2_tests
     unit/storage/page_test.cpp
     unit/storage/record_test.cpp
     unit/types/types_test.cpp
+    unit/transaction/transaction_manager_test.cpp
     integration/database_execution_test.cpp
+    integration/concurrency_database_test.cpp
     integration/persistent_database_test.cpp
     integration/shell_smoke_test.cpp
 )

@@ -6,6 +6,7 @@
 #include <list>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string_view>
 #include <vector>
@@ -47,12 +48,18 @@ public:
 private:
     friend class BufferPoolManager;
 
-    PinnedPage(BufferPoolManager& manager, PageId page_id, Page& page) noexcept;
+    PinnedPage(
+        BufferPoolManager& manager,
+        PageId page_id,
+        Page& page,
+        std::shared_ptr<std::recursive_mutex> page_latch);
     void Reset() noexcept;
 
     BufferPoolManager* manager_{nullptr};
     PageId page_id_{};
     Page* page_{nullptr};
+    std::shared_ptr<std::recursive_mutex> page_latch_owner_;
+    std::unique_lock<std::recursive_mutex> page_latch_;
     bool dirty_{false};
 };
 
@@ -86,6 +93,7 @@ private:
         std::optional<Page> page;
         std::uint32_t pin_count{0U};
         bool dirty{false};
+        std::shared_ptr<std::recursive_mutex> page_latch{std::make_shared<std::recursive_mutex>()};
     };
 
     BufferPoolManager(
@@ -97,7 +105,9 @@ private:
     [[nodiscard]] Status PrepareFrameForUse(std::size_t frame_id);
     [[nodiscard]] Status FlushFrame(std::size_t frame_id);
     [[nodiscard]] Status UnpinPage(PageId page_id, bool dirty);
-    [[nodiscard]] PinnedPage PinFrame(std::size_t frame_id);
+    [[nodiscard]] PinnedPage PinFrame(
+        std::size_t frame_id,
+        std::unique_lock<std::mutex>& manager_lock);
     void RemoveFromReplacer(std::size_t frame_id);
     void AddToReplacer(std::size_t frame_id);
     void IncrementMetric(std::string_view name) const;
@@ -107,6 +117,7 @@ private:
     std::map<std::uint64_t, std::size_t> page_table_;
     std::list<std::size_t> unpinned_lru_;
     MetricsRegistry* metrics_{nullptr};
+    mutable std::mutex mutex_;
 };
 
 }  // namespace kerndb::storage

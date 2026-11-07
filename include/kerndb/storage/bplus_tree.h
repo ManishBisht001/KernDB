@@ -2,6 +2,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <shared_mutex>
 #include <vector>
 
 #include "kerndb/ids.h"
@@ -35,7 +37,7 @@ public:
     [[nodiscard]] Result<void> Remove(std::int64_t key, RecordId record_id);
     [[nodiscard]] Result<RecordId> Search(std::int64_t key) const;
     [[nodiscard]] Result<std::vector<BPlusTreeEntry>> ScanAll() const;
-    [[nodiscard]] PageId root_page_id() const noexcept;
+    [[nodiscard]] PageId root_page_id() const;
 
 private:
     BPlusTree(PageManager& page_manager, PageId root_page_id) noexcept;
@@ -52,6 +54,7 @@ private:
 
     PageManager* page_manager_;
     PageId root_page_id_;
+    std::shared_ptr<std::shared_mutex> latch_{std::make_shared<std::shared_mutex>()};
 };
 
 }  // namespace kerndb::storage

@@ -1,12 +1,13 @@
 # KernDB implementation plan
 
-## Repository assessment
+## Initial repository assessment
 
-**Assessment date:** 2026-09-14
+**Assessment date:** 2026-09-14 (initial project snapshot)
 
-The repository contains only an initialized .git directory. It has no commits,
-tracked files, source tree, CMake project, tests, dependency manager, or existing
-architecture to preserve.
+At this initial snapshot, the repository contained only an initialized .git
+directory and no source tree, CMake project, tests, dependency manager, or
+existing architecture. The phase status later in this document reflects the
+current implementation rather than that original snapshot.
 
 KernDB can establish its subsystem boundaries from the first commit. The
 recommended baseline is C++20, CMake, CTest, and the standard library. The engine
@@ -37,8 +38,9 @@ INSERT INTO people VALUES (1, 'Ada');
 SELECT id, name FROM people WHERE id = 1;
 ~~~
 
-Joins, aggregates, NULL, concurrent writers, and crash guarantees are later
-milestones. Phase 5 adds explicit single-threaded multi-statement transactions.
+Joins, aggregates, NULL, and crash guarantees are later milestones. Phase 5
+added explicit multi-statement transactions; Phase 6 now adds concurrent
+persistent sessions within one process using strict two-phase locking.
 
 ## Recommended architecture
 
@@ -205,8 +207,11 @@ frame  -> bytes, pin count, dirty flag, page LSN, latch, replacer state
 - Callers cannot adjust pin counts; only guards unpin.
 - A deterministic LRU or clock replacer is sufficient initially. If all frames
   are pinned, return BufferPoolExhausted instead of waiting indefinitely.
-- Protect page-table metadata separately from per-frame contents. Never retain a
-  global buffer-pool mutex during disk I/O.
+- Protect page-table metadata separately from per-frame contents. In the
+  current synchronous implementation, the buffer-pool manager mutex remains
+  held during page reads, eviction flushes, and explicit flushes; this is a
+  throughput limitation. A later I/O reservation design should avoid retaining
+  that mutex during disk I/O.
 - Dirty flushing observes the WAL ordering hook. Deallocation waits until no
   guard, transaction, or index can reference a page.
 
@@ -238,22 +243,28 @@ Transactions transition through:
 
 ~~~
 ACTIVE -> COMMITTED
-ACTIVE -> ABORTING -> ABORTED
+ACTIVE -> ABORTED
 ~~~
 
-The mature transaction manager owns IDs, state transitions, write sets, last
-LSN, and each session's transaction. The current Phase 5 implementation is the
-single-threaded precursor: `Database` owns at most one explicit transaction,
-and persistent storage retains statement undo actions until `COMMIT` or
-`ROLLBACK`. With no explicit transaction, each mutation keeps autocommit
-behavior. The in-memory backend restores a catalog snapshot on rollback.
+`TransactionManager` owns unique IDs and independent lifecycle contexts in each
+database runtime. A `Database` is one session and can own at most one explicit
+transaction; separate `Database::Open` sessions for the same normalized
+persistent directory share the catalog, storage, transaction manager, and lock
+manager within the process. Persistent storage retains statement undo actions
+per transaction until `COMMIT` or `ROLLBACK`. With no explicit transaction,
+each statement uses an implicit transaction. The in-memory backend restores a
+catalog snapshot on rollback.
 
-The recommended initial concurrent model is **strict two-phase locking (strict
-2PL)**. The lock manager grants logical table, RID, and later index-key resources
-with shared and exclusive locks. Retain all locks to commit/abort in the first
-concurrent release. Resource queues, compatible-grant rules, waiters, and a
-wait-for graph support deterministic deadlock detection; a repeatable policy such
-as aborting the youngest transaction selects the victim.
+Phase 6 implements **rigorous two-phase locking** at catalog and table
+granularity. The lock manager grants shared (S) and exclusive (X) locks. Every
+transaction retains both modes until commit or abort. SQL statements first
+acquire a catalog lock; table statements then acquire S for `SELECT` or X for
+`INSERT`, `UPDATE`, `DELETE`, and `CREATE INDEX`. DDL takes catalog X. The wait
+queue respects earlier incompatible requests. When a request would wait, the
+manager rebuilds a wait-for graph from live holders and queued requests; if it
+finds a cycle, the requesting transaction is the victim. Its session reverses
+storage mutations, marks it aborted, releases its locks, and wakes waiters.
+There are no row- or key-level transaction locks in this phase.
 
 | Mechanism | Protects | Lifetime | Owner |
 | --- | --- | --- | --- |
@@ -261,8 +272,12 @@ as aborting the youngest transaction selects the victim.
 | Transaction lock | logical conflict/visibility | transaction | transaction |
 | Allocation mutex | allocation metadata | one update | subsystem operation |
 
-Never wait for a lock while retaining an unrelated page latch or buffer-pool
-mutex. Establish and assert lock ordering before background workers exist.
+Database acquires transaction locks before entering the executor or storage, so
+lock waits do not hold page guards. The lock order is transaction catalog lock,
+transaction table lock, persistent-storage mutex, B+ tree latch, buffer-pool
+metadata mutex, and page guard. The buffer pool drops its metadata mutex before
+waiting for a frame latch; a page guard drops that latch before unpinning under
+the metadata mutex. Keep this order if adding background workers.
 
 ## Recovery architecture
 
@@ -286,10 +301,12 @@ barriers inside disk management and test their failure translation.
 
 ## Threading model
 
-Start synchronous and single-threaded. The mature model may use client/session
-threads, an optional bounded query-worker pool, a WAL group-commit coordinator,
-a buffer writer, a maintenance/checkpoint/statistics worker, and an optional
-bounded event dispatcher.
+Query execution remains synchronous on the calling thread, but separate
+persistent `Database` sessions can execute concurrently. Calls on one
+`Database` instance are serialized. There is no query-worker pool, WAL
+group-commit coordinator, buffer writer, or maintenance worker. Future background
+workers must use `std::stop_token`, bounded queues or condition variables, and
+join before close.
 
 Every background thread uses std::stop_token, bounded queues or condition
 variables, and joins before close. No worker may retain a reference to a
@@ -458,7 +475,7 @@ sequential fallback; SQL integration.
 **Working at end:** indexed integer equality/range predicates use B+ trees while
 unindexed queries remain correct heap scans.
 
-### Phase 5 — Mutation and single-threaded transactions
+### Phase 5 — Mutation and explicit transactions
 
 **Goal:** Add explicit transaction semantics before session interleaving.
 
@@ -478,29 +495,53 @@ multiple-mutation reverse undo; index/RID consistency; statement failure
 atomicity and continued transaction use; mutation failure injection; active
 transaction close rollback.
 
-**Working at end:** one thread supports explicit and autocommit transactions
-during normal execution and orderly shutdown. Transactional DDL, concurrent
-sessions, crash atomicity, and recovery are not promised.
+**Working at end:** explicit/autocommit transactions support statement
+compensation and normal clean shutdown. Phase 6 extends this with concurrent
+persistent sessions. Transactional DDL and crash recovery are not promised.
 
 ### Phase 6 — Concurrent sessions and strict 2PL
 
 **Goal:** Safely run multiple sessions without data or logical races.
 
-**Components:** session manager; lock resource IDs/queues; S/X locks; strict
-2PL; wait-for deadlock detection/victim rollback; latch-order assertions; shared
-buffer pool safety; transaction/lock telemetry.
+**Implemented behavior:** separate `Database::Open` sessions sharing the same
+normalized persistent path in one process; process-unique transaction IDs and
+independent transaction states; thread-safe catalog/table S/X lock queues;
+rigorous 2PL; wait-for cycle detection with requesting-transaction victim
+rollback; persistent-storage, buffer-pool, and B+ tree synchronization.
+
+**Lock scope:** the catalog uses S for ordinary statements and X for DDL. Each
+transaction holds catalog S from `BEGIN` through completion. Table reads use S;
+table writes and index creation use X. All locks, including S locks, remain held
+through commit or abort. Same-session calls serialize on the `Database` object.
+The in-memory backend remains per-`Database`; cross-session sharing applies to
+persistent databases opened through the process-local runtime registry.
 
 **Dependencies:** Phases 3 and 5; abort must be dependable.
 
-**Expected files/modules:** lock manager, transaction manager, deadlock detector,
-deterministic scheduler/test hooks, and concurrency documentation.
+**Implementation areas:** `src/concurrency/lock_manager.cpp`,
+`src/transaction/transaction_manager.cpp`, `src/database.cpp`,
+`src/storage/persistent_storage.cpp`, `src/storage/buffer_pool.cpp`, and
+`src/storage/bplus_tree.cpp`. There is no separate session-manager module or
+lock telemetry interface in this implementation.
 
-**Tests:** lock compatibility; X waits; retention; upgrade policy; deadlock
-cycle/victim; wait cancellation on abort; sanitizer races; forced scan/write
-interleavings; assertion that lock wait holds no page latch.
+**Tests:** `LockManagerAllowsSharedReadersAndBlocksExclusiveRequests`,
+`LockManagerBlocksSharedRequestsBehindExclusiveHolders`,
+`LockManagerDetectsUpgradeDeadlockAndWakesTheOtherWaiter`,
+`LockManagerReleasesWaitersWhenTheirTransactionIsAborted`,
+`BufferPoolSerializesConcurrentPageGuardAccess`,
+`BPlusTreeSupportsConcurrentInsertionsAndLookups`,
+`TransactionManagerCreatesUniqueContextsAndTracksTerminalStates`, and the
+`PersistentSessions...` integration tests. The lock-before-storage structure
+keeps logical lock waits outside page guards. Sanitizer results are recorded
+with the verification run; ThreadSanitizer is not available in the configured
+native Windows toolchain.
 
-**Working at end:** local sessions provide documented strict-2PL behavior and
-predictable deadlock resolution.
+**Status:** Implemented for same-process persistent sessions through
+`Database::Open`. Table-level strict 2PL prevents conflicting reads/writes and
+provides conflict-serializable SQL transaction execution at that granularity.
+The persistent storage mutex still serializes physical writes across tables.
+There is no cross-process coordination, MVCC, WAL, crash recovery, or
+crash-safe transactional durability. See `docs/CONCURRENCY_PHASE6.md`.
 
 ### Phase 7 — WAL and crash recovery
 
@@ -575,18 +616,18 @@ invariants.
 4. **SQL v0:** Recommend CREATE TABLE, INSERT, single-table SELECT ... WHERE,
    INT, and TEXT. Confirm NULL behavior, constraints, identifier casing, and
    early required types.
-5. **Concurrency model:** Recommend strict 2PL/serializable behavior before
-   optional MVCC. Confirm whether MVCC or snapshot isolation is a priority.
-6. **Durability timing:** Recommend clean-shutdown persistence through Phase 6,
-   full crash safety in Phase 7. Confirm whether minimal WAL belongs earlier.
+5. **Concurrency model:** Phase 6 implements table-level strict 2PL for
+   same-process persistent sessions. MVCC and cross-process locking remain
+   deferred.
+6. **Durability timing:** Phases 2–6 persist through clean shutdown. Crash
+   recovery and crash-safe transaction durability remain Phase 7 work.
 7. **Test policy:** Recommend CTest plus an in-repo harness initially. Confirm
    whether GoogleTest or Catch2 is preferred.
 8. **Telemetry consumers:** Recommend in-process snapshots/events without HTTP
    in the engine. Confirm whether web UI, Prometheus-style scraping, logs, or
    tracing should shape the future contract.
-9. **Learning priority:** Confirm the most important advanced topics among
-   recovery, concurrency, query processing, indexing, and OS I/O.
+9. **Learning priority:** The remaining staged work is crash recovery and then
+   broader query and operations support, as listed in Phases 7 and 8.
 
-After approval, implementation begins only with Phase 0. Phase 1 proves SQL
-semantics in memory; Phase 2 adds durable storage; the rest is deliberately
-staged for correctness and learning.
+These questions preserve the original planning context. The Phase 5 and Phase 6
+status sections above describe what has since been implemented and verified.

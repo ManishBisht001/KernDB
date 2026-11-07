@@ -15,10 +15,16 @@ namespace {
 
 }  // namespace
 
-PinnedPage::PinnedPage(BufferPoolManager& manager, PageId page_id, Page& page) noexcept
+PinnedPage::PinnedPage(
+    BufferPoolManager& manager,
+    PageId page_id,
+    Page& page,
+    std::shared_ptr<std::recursive_mutex> page_latch)
     : manager_(&manager),
       page_id_(page_id),
-      page_(&page) {}
+      page_(&page),
+      page_latch_owner_(std::move(page_latch)),
+      page_latch_(*page_latch_owner_) {}
 
 PinnedPage::~PinnedPage() {
     static_cast<void>(Release());
@@ -28,6 +34,8 @@ PinnedPage::PinnedPage(PinnedPage&& other) noexcept
     : manager_(other.manager_),
       page_id_(other.page_id_),
       page_(other.page_),
+      page_latch_owner_(std::move(other.page_latch_owner_)),
+      page_latch_(std::move(other.page_latch_)),
       dirty_(other.dirty_) {
     other.Reset();
 }
@@ -38,6 +46,8 @@ PinnedPage& PinnedPage::operator=(PinnedPage&& other) noexcept {
         manager_ = other.manager_;
         page_id_ = other.page_id_;
         page_ = other.page_;
+        page_latch_owner_ = std::move(other.page_latch_owner_);
+        page_latch_ = std::move(other.page_latch_);
         dirty_ = other.dirty_;
         other.Reset();
     }
@@ -70,6 +80,9 @@ Status PinnedPage::Release() {
     BufferPoolManager* const manager = manager_;
     const PageId page_id = page_id_;
     const bool dirty = dirty_;
+    if (page_latch_.owns_lock()) {
+        page_latch_.unlock();
+    }
     Reset();
     return manager->UnpinPage(page_id, dirty);
 }
@@ -78,6 +91,8 @@ void PinnedPage::Reset() noexcept {
     manager_ = nullptr;
     page_id_ = PageId{};
     page_ = nullptr;
+    page_latch_ = std::unique_lock<std::recursive_mutex>{};
+    page_latch_owner_.reset();
     dirty_ = false;
 }
 
@@ -102,6 +117,7 @@ BufferPoolManager::~BufferPoolManager() {
 }
 
 Result<PinnedPage> BufferPoolManager::FetchPage(PageId page_id) {
+    std::unique_lock manager_lock(mutex_);
     if (!page_id.valid()) {
         IncrementMetric("buffer_pool.failed_fetches");
         return PoolError(ErrorCode::kInvalidArgument, "cannot fetch an invalid page ID");
@@ -117,7 +133,7 @@ Result<PinnedPage> BufferPoolManager::FetchPage(PageId page_id) {
         ++frame.pin_count;
         RemoveFromReplacer(frame_id);
         IncrementMetric("buffer_pool.page_hits");
-        return PinFrame(frame_id);
+        return PinFrame(frame_id, manager_lock);
     }
 
     IncrementMetric("buffer_pool.page_misses");
@@ -147,10 +163,11 @@ Result<PinnedPage> BufferPoolManager::FetchPage(PageId page_id) {
     frame.pin_count = 1U;
     frame.dirty = false;
     page_table_.emplace(page_id.value(), frame_id.value());
-    return PinFrame(frame_id.value());
+    return PinFrame(frame_id.value(), manager_lock);
 }
 
 Result<PinnedPage> BufferPoolManager::NewPage(PageType type) {
+    std::unique_lock manager_lock(mutex_);
     const auto page_count = disk_manager_->PageCount();
     if (!page_count.ok()) {
         IncrementMetric("buffer_pool.failed_allocations");
@@ -190,10 +207,11 @@ Result<PinnedPage> BufferPoolManager::NewPage(PageType type) {
     frame.pin_count = 1U;
     frame.dirty = false;
     page_table_.emplace(page_id.value(), frame_id.value());
-    return PinFrame(frame_id.value());
+    return PinFrame(frame_id.value(), manager_lock);
 }
 
 Status BufferPoolManager::FlushPage(PageId page_id) {
+    std::scoped_lock lock(mutex_);
     const auto iterator = page_table_.find(page_id.value());
     if (iterator == page_table_.end()) {
         return PoolError(ErrorCode::kNotFound, "page is not resident in the buffer pool")
@@ -203,6 +221,7 @@ Status BufferPoolManager::FlushPage(PageId page_id) {
 }
 
 Status BufferPoolManager::FlushAllPages() {
+    std::scoped_lock lock(mutex_);
     for (std::size_t frame_id = 0U; frame_id < frames_.size(); ++frame_id) {
         const Status flush_status = FlushFrame(frame_id);
         if (!flush_status.ok()) {
@@ -213,6 +232,7 @@ Status BufferPoolManager::FlushAllPages() {
 }
 
 Status BufferPoolManager::DeletePage(PageId page_id) {
+    std::scoped_lock lock(mutex_);
     if (!page_id.valid()) {
         return PoolError(ErrorCode::kInvalidArgument, "cannot delete an invalid page ID");
     }
@@ -242,6 +262,7 @@ Status BufferPoolManager::DeletePage(PageId page_id) {
 }
 
 Result<std::uint64_t> BufferPoolManager::PageCount() const {
+    std::scoped_lock lock(mutex_);
     return disk_manager_->PageCount();
 }
 
@@ -295,6 +316,7 @@ Status BufferPoolManager::FlushFrame(std::size_t frame_id) {
     if (!frame.page.has_value() || !frame.dirty) {
         return Status::Ok();
     }
+    std::scoped_lock page_lock(*frame.page_latch);
     const Status finalize_status = frame.page->Finalize();
     if (!finalize_status.ok()) {
         return finalize_status;
@@ -309,6 +331,7 @@ Status BufferPoolManager::FlushFrame(std::size_t frame_id) {
 }
 
 Status BufferPoolManager::UnpinPage(PageId page_id, bool dirty) {
+    std::scoped_lock lock(mutex_);
     const auto iterator = page_table_.find(page_id.value());
     if (iterator == page_table_.end()) {
         return PoolError(ErrorCode::kInternal, "pinned page is absent from the buffer pool")
@@ -329,10 +352,16 @@ Status BufferPoolManager::UnpinPage(PageId page_id, bool dirty) {
     return Status::Ok();
 }
 
-PinnedPage BufferPoolManager::PinFrame(std::size_t frame_id) {
+PinnedPage BufferPoolManager::PinFrame(
+    std::size_t frame_id,
+    std::unique_lock<std::mutex>& manager_lock) {
     Frame& frame = frames_[frame_id];
     assert(frame.page.has_value());
-    return PinnedPage{*this, frame.page->page_id(), *frame.page};
+    const PageId page_id = frame.page->page_id();
+    Page* const page = &*frame.page;
+    std::shared_ptr<std::recursive_mutex> page_latch = frame.page_latch;
+    manager_lock.unlock();
+    return PinnedPage{*this, page_id, *page, std::move(page_latch)};
 }
 
 void BufferPoolManager::RemoveFromReplacer(std::size_t frame_id) {

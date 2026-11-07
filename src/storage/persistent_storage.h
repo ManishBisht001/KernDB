@@ -5,6 +5,9 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <optional>
+#include <shared_mutex>
 #include <vector>
 
 #include "catalog_store.h"
@@ -16,7 +19,7 @@ namespace kerndb::storage {
 class PersistentStorage final : public TableStorage {
 public:
 #if defined(KERNDB_ENABLE_TEST_HOOKS)
-    void FailNextUpdateAfterRowMutationForTesting() noexcept;
+    void FailNextUpdateAfterRowMutationForTesting();
 #endif
 
     [[nodiscard]] static Result<std::unique_ptr<PersistentStorage>> Open(
@@ -24,23 +27,32 @@ public:
         InMemoryCatalog& catalog);
     ~PersistentStorage() override;
 
-    Status BeginTransaction() override;
-    Status CommitTransaction() override;
-    Status RollbackTransaction() override;
+    using TableStorage::BeginTransaction;
+    using TableStorage::CommitTransaction;
+    using TableStorage::RollbackTransaction;
+
+    Status BeginTransaction(TransactionId transaction_id) override;
+    Status CommitTransaction(TransactionId transaction_id) override;
+    Status RollbackTransaction(TransactionId transaction_id) override;
 
     [[nodiscard]] Result<void> CreateTable(const InMemoryTable& table) override;
     [[nodiscard]] Result<PageId> CreateIndex(const InMemoryIndex& index) override;
-    [[nodiscard]] Result<RecordId> Insert(const InMemoryTable& table, const Tuple& tuple) override;
+    [[nodiscard]] Result<RecordId> Insert(
+        const InMemoryTable& table,
+        const Tuple& tuple,
+        std::optional<TransactionId> transaction_id = std::nullopt) override;
     [[nodiscard]] Result<std::uint64_t> UpdateMatching(
         const InMemoryTable& table,
         std::size_t column_index,
         const Value& value,
         std::size_t predicate_column_index,
-        const Value& predicate_value) override;
+        const Value& predicate_value,
+        std::optional<TransactionId> transaction_id = std::nullopt) override;
     [[nodiscard]] Result<std::uint64_t> DeleteMatching(
         const InMemoryTable& table,
         std::size_t predicate_column_index,
-        const Value& predicate_value) override;
+        const Value& predicate_value,
+        std::optional<TransactionId> transaction_id = std::nullopt) override;
     [[nodiscard]] Result<std::vector<Tuple>> Scan(const InMemoryTable& table) const override;
     [[nodiscard]] Result<IndexLookup> LookupByIndex(
         const InMemoryTable& table,
@@ -48,6 +60,8 @@ public:
         std::int64_t key) const override;
 
 private:
+    using UndoActions = std::vector<std::function<Status()>>;
+
     PersistentStorage(
         std::filesystem::path database_directory,
         CatalogStore catalog_store,
@@ -75,6 +89,8 @@ private:
         const InMemoryIndex& index,
         std::int64_t key,
         RecordId record_id) const;
+    [[nodiscard]] Result<UndoActions*> ResolveUndoActions(
+        std::optional<TransactionId> transaction_id);
 
     std::filesystem::path database_directory_;
     CatalogStore catalog_store_;
@@ -83,8 +99,9 @@ private:
     mutable std::map<std::uint64_t, std::unique_ptr<PageManager>> table_pages_;
     mutable std::map<std::uint64_t, std::unique_ptr<PageManager>> index_pages_;
     std::map<std::uint64_t, InMemoryIndex> indexes_by_id_;
-    std::vector<std::function<Status()>> transaction_undo_actions_;
-    bool transaction_active_{false};
+    std::map<std::uint64_t, UndoActions> transaction_undo_actions_;
+    mutable std::shared_mutex mutex_;
+    mutable std::mutex page_cache_mutex_;
 #if defined(KERNDB_ENABLE_TEST_HOOKS)
     bool fail_after_next_update_row_for_testing_{false};
 #endif

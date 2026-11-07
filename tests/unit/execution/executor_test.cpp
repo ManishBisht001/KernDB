@@ -27,7 +27,11 @@ kerndb::Result<kerndb::QueryResult> Execute(
     if (!plan.ok()) {
         return plan.status();
     }
-    kerndb::execution::ExecutionContext context{.catalog = catalog};
+    kerndb::execution::ExecutionContext context{
+        .catalog = catalog,
+        .table_storage = nullptr,
+        .transaction_id = std::nullopt,
+    };
     return kerndb::execution::ExecutePlan(plan.value(), context);
 }
 
