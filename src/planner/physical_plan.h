@@ -37,6 +37,18 @@ struct PhysicalIndexScan {
     binder::BoundPredicate predicate;
 };
 
+struct PhysicalAdvancedSelect {
+    TableId table_id;
+    std::optional<TableId> joined_table_id;
+    binder::BoundSelect select;
+};
+
+struct PhysicalExplainSelect {
+    TableId table_id;
+    std::optional<TableId> joined_table_id;
+    std::string plan_text;
+};
+
 struct PhysicalUpdate {
     TableId table_id;
     std::size_t column_index;
@@ -55,6 +67,8 @@ using PhysicalPlan = std::variant<
     PhysicalInsert,
     PhysicalSequentialScan,
     PhysicalIndexScan,
+    PhysicalAdvancedSelect,
+    PhysicalExplainSelect,
     PhysicalUpdate,
     PhysicalDelete>;
 

@@ -7,21 +7,28 @@
 #include "planner/planner.h"
 #include "test_framework.h"
 
-KERNDB_TEST(PlannerLowersIntEqualityToAnIndexScanCandidate) {
+KERNDB_TEST(PlannerUsesAnAvailablePersistentIntIndex) {
     kerndb::InMemoryCatalog catalog;
     const kerndb::Schema schema{
         kerndb::ColumnDefinition{.name = "id", .type = kerndb::ColumnType::kInt},
     };
-    KERNDB_EXPECT(catalog.CreateTable("people", schema).ok());
+    const auto table_id = catalog.CreateTable("people", schema);
+    KERNDB_EXPECT(table_id.ok());
 
     const auto ast = kerndb::parser::ParseSql("SELECT id FROM people WHERE id = 1");
     KERNDB_EXPECT(ast.ok());
+    const auto unindexed = kerndb::binder::BindStatement(ast.value(), catalog);
+    KERNDB_EXPECT(unindexed.ok());
+    const auto sequential = kerndb::planner::PlanStatement(unindexed.value(), true);
+    KERNDB_EXPECT(sequential.ok());
+    KERNDB_EXPECT(std::holds_alternative<kerndb::planner::PhysicalSequentialScan>(sequential.value()));
+
+    KERNDB_EXPECT(catalog.CreateIndex("people_id_idx", table_id.value(), 0U).ok());
     const auto bound = kerndb::binder::BindStatement(ast.value(), catalog);
     KERNDB_EXPECT(bound.ok());
-
     const kerndb::planner::LogicalPlan logical = kerndb::planner::BuildLogicalPlan(bound.value());
     KERNDB_EXPECT(std::holds_alternative<kerndb::planner::LogicalSelect>(logical));
-    const auto physical = kerndb::planner::PlanStatement(bound.value());
+    const auto physical = kerndb::planner::PlanStatement(bound.value(), true);
     KERNDB_EXPECT(physical.ok());
     KERNDB_EXPECT(std::holds_alternative<kerndb::planner::PhysicalIndexScan>(
         physical.value()));

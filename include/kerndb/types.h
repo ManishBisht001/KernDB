@@ -11,9 +11,12 @@ namespace kerndb {
 enum class ColumnType : std::uint8_t {
     kInt,
     kText,
+    // REAL and NULL are result types only; SQL table storage remains INT/TEXT.
+    kReal,
+    kNull,
 };
 
-using Value = std::variant<std::int64_t, std::string>;
+using Value = std::variant<std::int64_t, std::string, double, std::monostate>;
 
 struct ColumnDefinition {
     std::string name;

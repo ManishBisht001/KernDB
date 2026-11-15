@@ -121,3 +121,50 @@ KERNDB_TEST(BinderResolvesUpdateAndDeleteMutations) {
     KERNDB_EXPECT(!rejected.ok());
     KERNDB_EXPECT_EQ(kerndb::ErrorCode::kType, rejected.status().code());
 }
+
+KERNDB_TEST(BinderResolvesQualifiedJoinColumnsAndRejectsAmbiguity) {
+    kerndb::InMemoryCatalog catalog = MakeCatalog();
+    KERNDB_EXPECT(catalog.CreateTable("visits", {
+        {.name = "id", .type = kerndb::ColumnType::kInt},
+        {.name = "person_id", .type = kerndb::ColumnType::kInt},
+        {.name = "score", .type = kerndb::ColumnType::kInt},
+    }).ok());
+
+    const auto qualified = kerndb::parser::ParseSql(
+        "SELECT people.name, visits.score FROM people INNER JOIN visits "
+        "ON visits.person_id = people.id ORDER BY visits.score DESC");
+    KERNDB_EXPECT(qualified.ok());
+    const auto bound = kerndb::binder::BindStatement(qualified.value(), catalog);
+    KERNDB_EXPECT(bound.ok());
+    const auto& select = std::get<kerndb::binder::BoundSelect>(bound.value());
+    KERNDB_EXPECT(select.join.has_value());
+    KERNDB_EXPECT_EQ(std::size_t{0U}, select.join->left_column.relation_index);
+
+    const auto ambiguous = kerndb::parser::ParseSql(
+        "SELECT id FROM people JOIN visits ON people.id = visits.person_id");
+    KERNDB_EXPECT(ambiguous.ok());
+    const auto rejected = kerndb::binder::BindStatement(ambiguous.value(), catalog);
+    KERNDB_EXPECT(!rejected.ok());
+    KERNDB_EXPECT_EQ(kerndb::ErrorCode::kBinding, rejected.status().code());
+}
+
+KERNDB_TEST(BinderValidatesGroupingAggregateTypesAndLimit) {
+    kerndb::InMemoryCatalog catalog = MakeCatalog();
+    const auto wrong_aggregate = kerndb::parser::ParseSql("SELECT SUM(name) FROM people");
+    KERNDB_EXPECT(wrong_aggregate.ok());
+    const auto rejected_aggregate = kerndb::binder::BindStatement(wrong_aggregate.value(), catalog);
+    KERNDB_EXPECT(!rejected_aggregate.ok());
+    KERNDB_EXPECT_EQ(kerndb::ErrorCode::kType, rejected_aggregate.status().code());
+
+    const auto ungrouped = kerndb::parser::ParseSql("SELECT name, COUNT(*) FROM people GROUP BY id");
+    KERNDB_EXPECT(ungrouped.ok());
+    const auto rejected_column = kerndb::binder::BindStatement(ungrouped.value(), catalog);
+    KERNDB_EXPECT(!rejected_column.ok());
+    KERNDB_EXPECT_EQ(kerndb::ErrorCode::kBinding, rejected_column.status().code());
+
+    const auto negative_limit = kerndb::parser::ParseSql("SELECT id FROM people LIMIT -1");
+    KERNDB_EXPECT(negative_limit.ok());
+    const auto rejected_limit = kerndb::binder::BindStatement(negative_limit.value(), catalog);
+    KERNDB_EXPECT(!rejected_limit.ok());
+    KERNDB_EXPECT_EQ(kerndb::ErrorCode::kInvalidArgument, rejected_limit.status().code());
+}

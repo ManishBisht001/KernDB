@@ -29,6 +29,15 @@ struct LogicalSelect {
     TableId table_id;
     std::vector<std::size_t> projection_indices;
     std::optional<binder::BoundPredicate> predicate;
+    bool use_index{false};
+};
+
+struct LogicalAdvancedSelect {
+    binder::BoundSelect select;
+};
+
+struct LogicalExplainSelect {
+    binder::BoundSelect select;
 };
 
 struct LogicalUpdate {
@@ -48,6 +57,8 @@ using LogicalPlan = std::variant<
     LogicalCreateIndex,
     LogicalInsert,
     LogicalSelect,
+    LogicalAdvancedSelect,
+    LogicalExplainSelect,
     LogicalUpdate,
     LogicalDelete>;
 

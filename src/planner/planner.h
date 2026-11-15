@@ -9,6 +9,8 @@ namespace kerndb::planner {
 
 [[nodiscard]] LogicalPlan BuildLogicalPlan(const binder::BoundStatement& statement);
 [[nodiscard]] PhysicalPlan BuildPhysicalPlan(const LogicalPlan& plan);
-[[nodiscard]] Result<PhysicalPlan> PlanStatement(const binder::BoundStatement& statement);
+[[nodiscard]] Result<PhysicalPlan> PlanStatement(
+    const binder::BoundStatement& statement,
+    bool persistent_storage_available = false);
 
 }  // namespace kerndb::planner

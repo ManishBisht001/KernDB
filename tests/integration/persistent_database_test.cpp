@@ -84,6 +84,35 @@ KERNDB_TEST(PersistentDatabaseReopensTheApprovedVerticalSlice) {
     }
 }
 
+KERNDB_TEST(PersistentOptimizerExplainsAndUsesAnAvailableEqualityIndex) {
+    kerndb::test::TemporaryDirectory directory;
+    const std::filesystem::path database_path = directory.path() / "indexed_queries";
+    {
+        auto opened = kerndb::Database::Open(database_path);
+        KERNDB_EXPECT(opened.ok());
+        auto database = std::move(opened).value();
+        KERNDB_EXPECT(database.Execute("CREATE TABLE values_table (id INT, label TEXT)").ok());
+        KERNDB_EXPECT(database.Execute("INSERT INTO values_table VALUES (1, 'one')").ok());
+        KERNDB_EXPECT(database.Execute("INSERT INTO values_table VALUES (2, 'two')").ok());
+        KERNDB_EXPECT(database.Execute("CREATE INDEX values_id_idx ON values_table(id)").ok());
+
+        const auto explain = database.Execute("EXPLAIN SELECT label FROM values_table WHERE id = 2");
+        KERNDB_EXPECT(explain.ok());
+        std::string plan;
+        for (const auto& row : explain.value().rows) {
+            plan += std::get<std::string>(row[0]);
+            plan += "\n";
+        }
+        KERNDB_EXPECT(plan.find("Index Scan [values_table]") != std::string::npos);
+
+        const auto selected = database.Execute(
+            "SELECT label FROM values_table WHERE id = 2 ORDER BY label LIMIT 1");
+        KERNDB_EXPECT(selected.ok());
+        KERNDB_EXPECT_EQ(std::size_t{1U}, selected.value().rows.size());
+        KERNDB_EXPECT_EQ(std::string("two"), std::get<std::string>(selected.value().rows[0][0]));
+    }
+}
+
 KERNDB_TEST(PersistentDatabaseReportsACatalogReferencedMissingTableFile) {
     kerndb::test::TemporaryDirectory directory;
     const std::filesystem::path database_path = directory.path() / "missing_table_database";

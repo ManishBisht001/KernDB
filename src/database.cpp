@@ -127,11 +127,11 @@ std::map<std::string, std::weak_ptr<DatabaseRuntime>, std::less<>> g_runtime_reg
            std::holds_alternative<parser::AstCreateIndex>(statement);
 }
 
-[[nodiscard]] std::optional<std::pair<TableId, concurrency::LockMode>> LockTarget(
+[[nodiscard]] std::vector<std::pair<TableId, concurrency::LockMode>> LockTargets(
     const planner::PhysicalPlan& plan) {
     return std::visit(
-        [](const auto& physical_plan)
-            -> std::optional<std::pair<TableId, concurrency::LockMode>> {
+        [](const auto& physical_plan) {
+            std::vector<std::pair<TableId, concurrency::LockMode>> targets;
             using PlanType = std::decay_t<decltype(physical_plan)>;
             if constexpr (requires { physical_plan.table_id; }) {
                 concurrency::LockMode mode = concurrency::LockMode::kShared;
@@ -141,9 +141,18 @@ std::map<std::string, std::weak_ptr<DatabaseRuntime>, std::less<>> g_runtime_reg
                               std::is_same_v<PlanType, planner::PhysicalDelete>) {
                     mode = concurrency::LockMode::kExclusive;
                 }
-                return std::pair{physical_plan.table_id, mode};
+                targets.emplace_back(physical_plan.table_id, mode);
             }
-            return std::nullopt;
+            if constexpr (std::is_same_v<PlanType, planner::PhysicalAdvancedSelect> ||
+                          std::is_same_v<PlanType, planner::PhysicalExplainSelect>) {
+                if (physical_plan.joined_table_id.has_value()) {
+                    targets.emplace_back(physical_plan.joined_table_id.value(), concurrency::LockMode::kShared);
+                }
+            }
+            std::sort(targets.begin(), targets.end(), [](const auto& left, const auto& right) {
+                return left.first.value() < right.first.value();
+            });
+            return targets;
         },
         plan);
 }
@@ -279,17 +288,18 @@ Result<QueryResult> Database::Execute(std::string_view sql) {
         return finish_on_error(bound_statement.status());
     }
 
-    const auto physical_plan = planner::PlanStatement(bound_statement.value());
+    const auto physical_plan = planner::PlanStatement(
+        bound_statement.value(), runtime_->table_storage != nullptr);
     if (!physical_plan.ok()) {
         return finish_on_error(physical_plan.status());
     }
 
-    const auto lock_target = LockTarget(physical_plan.value());
-    if (lock_target.has_value()) {
+    const auto lock_targets = LockTargets(physical_plan.value());
+    for (const auto& lock_target : lock_targets) {
         const Status table_lock = runtime_->lock_manager->Acquire(
             *transaction,
-            concurrency::LockResource::Table(lock_target->first),
-            lock_target->second);
+            concurrency::LockResource::Table(lock_target.first),
+            lock_target.second);
         if (!table_lock.ok()) {
             if (!implicit_transaction && table_lock.code() == ErrorCode::kDeadlock) {
                 const Status rollback_status = RollbackActiveTransaction();

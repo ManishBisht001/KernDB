@@ -20,6 +20,28 @@ struct AstLiteral {
     SourceSpan span;
 };
 
+struct AstColumnRef {
+    std::optional<AstIdentifier> qualifier;
+    AstIdentifier name;
+};
+
+enum class ComparisonOperator {
+    kEqual,
+    kNotEqual,
+    kLess,
+    kLessEqual,
+    kGreater,
+    kGreaterEqual,
+};
+
+enum class AstAggregateFunction {
+    kCount,
+    kSum,
+    kAvg,
+    kMin,
+    kMax,
+};
+
 struct AstColumnDefinition {
     AstIdentifier name;
     ColumnType type;
@@ -47,10 +69,57 @@ struct AstPredicate {
     AstLiteral literal;
 };
 
-struct AstSelect {
-    std::vector<AstIdentifier> projections;
+struct AstSelectPredicate {
+    AstColumnRef column;
+    AstLiteral literal;
+    ComparisonOperator comparison{ComparisonOperator::kEqual};
+};
+
+struct AstSelectItem {
+    std::optional<AstAggregateFunction> aggregate;
+    std::optional<AstColumnRef> column;
+    bool count_star{false};
+    SourceSpan span;
+};
+
+enum class AstJoinKind {
+    kInner,
+    kLeft,
+};
+
+struct AstJoin {
+    AstJoinKind kind{AstJoinKind::kInner};
     AstIdentifier table_name;
-    std::optional<AstPredicate> predicate;
+    AstColumnRef left_column;
+    AstColumnRef right_column;
+};
+
+struct AstGroupHaving {
+    AstAggregateFunction aggregate{AstAggregateFunction::kCount};
+    std::optional<AstColumnRef> column;
+    bool count_star{false};
+    ComparisonOperator comparison{ComparisonOperator::kEqual};
+    AstLiteral literal;
+};
+
+struct AstOrderBy {
+    AstColumnRef column;
+    bool ascending{true};
+};
+
+struct AstSelect {
+    std::vector<AstSelectItem> projections;
+    AstIdentifier table_name;
+    std::optional<AstSelectPredicate> predicate;
+    std::optional<AstJoin> join;
+    std::vector<AstColumnRef> group_by;
+    std::optional<AstGroupHaving> having;
+    std::vector<AstOrderBy> order_by;
+    std::optional<std::int64_t> limit;
+};
+
+struct AstExplainSelect {
+    AstSelect select;
 };
 
 struct AstUpdate {
@@ -76,6 +145,7 @@ using AstStatement = std::variant<
     AstCreateIndex,
     AstInsert,
     AstSelect,
+    AstExplainSelect,
     AstUpdate,
     AstDelete,
     AstBegin,
