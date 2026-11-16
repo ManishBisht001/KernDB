@@ -84,6 +84,22 @@ namespace {
     if (normalized == "text") {
         return TokenKind::kText;
     }
+    if (normalized == "join") return TokenKind::kJoin;
+    if (normalized == "inner") return TokenKind::kInner;
+    if (normalized == "left") return TokenKind::kLeft;
+    if (normalized == "group") return TokenKind::kGroup;
+    if (normalized == "by") return TokenKind::kBy;
+    if (normalized == "having") return TokenKind::kHaving;
+    if (normalized == "order") return TokenKind::kOrder;
+    if (normalized == "asc") return TokenKind::kAsc;
+    if (normalized == "desc") return TokenKind::kDesc;
+    if (normalized == "limit") return TokenKind::kLimit;
+    if (normalized == "count") return TokenKind::kCount;
+    if (normalized == "sum") return TokenKind::kSum;
+    if (normalized == "avg") return TokenKind::kAvg;
+    if (normalized == "min") return TokenKind::kMin;
+    if (normalized == "max") return TokenKind::kMax;
+    if (normalized == "explain") return TokenKind::kExplain;
     return TokenKind::kIdentifier;
 }
 
@@ -143,8 +159,39 @@ public:
                 case '=':
                     tokens.push_back(Token{TokenKind::kEqual, "=", SourceSpan{start, location_}});
                     break;
+                case '!':
+                    if (AtEnd() || Peek() != '=') {
+                        return SyntaxError(start, "expected '=' after '!'");
+                    }
+                    Advance();
+                    tokens.push_back(Token{TokenKind::kNotEqual, "!=", SourceSpan{start, location_}});
+                    break;
+                case '<': {
+                    const bool inclusive = !AtEnd() && Peek() == '=';
+                    if (inclusive) Advance();
+                    tokens.push_back(Token{
+                        inclusive ? TokenKind::kLessEqual : TokenKind::kLess,
+                        inclusive ? "<=" : "<",
+                        SourceSpan{start, location_}});
+                    break;
+                }
+                case '>': {
+                    const bool inclusive = !AtEnd() && Peek() == '=';
+                    if (inclusive) Advance();
+                    tokens.push_back(Token{
+                        inclusive ? TokenKind::kGreaterEqual : TokenKind::kGreater,
+                        inclusive ? ">=" : ">",
+                        SourceSpan{start, location_}});
+                    break;
+                }
                 case '-':
                     tokens.push_back(Token{TokenKind::kMinus, "-", SourceSpan{start, location_}});
+                    break;
+                case '.':
+                    tokens.push_back(Token{TokenKind::kDot, ".", SourceSpan{start, location_}});
+                    break;
+                case '*':
+                    tokens.push_back(Token{TokenKind::kStar, "*", SourceSpan{start, location_}});
                     break;
                 default:
                     return SyntaxError(
@@ -279,8 +326,22 @@ std::string_view TokenKindName(TokenKind kind) noexcept {
             return "';'";
         case TokenKind::kEqual:
             return "'='";
+        case TokenKind::kNotEqual:
+            return "'!='";
+        case TokenKind::kLess:
+            return "'<'";
+        case TokenKind::kLessEqual:
+            return "'<='";
+        case TokenKind::kGreater:
+            return "'>'";
+        case TokenKind::kGreaterEqual:
+            return "'>='";
         case TokenKind::kMinus:
             return "'-'";
+        case TokenKind::kDot:
+            return "'.'";
+        case TokenKind::kStar:
+            return "'*'";
         case TokenKind::kCreate:
             return "CREATE";
         case TokenKind::kTable:
@@ -317,6 +378,22 @@ std::string_view TokenKindName(TokenKind kind) noexcept {
             return "INT";
         case TokenKind::kText:
             return "TEXT";
+        case TokenKind::kJoin: return "JOIN";
+        case TokenKind::kInner: return "INNER";
+        case TokenKind::kLeft: return "LEFT";
+        case TokenKind::kGroup: return "GROUP";
+        case TokenKind::kBy: return "BY";
+        case TokenKind::kHaving: return "HAVING";
+        case TokenKind::kOrder: return "ORDER";
+        case TokenKind::kAsc: return "ASC";
+        case TokenKind::kDesc: return "DESC";
+        case TokenKind::kLimit: return "LIMIT";
+        case TokenKind::kCount: return "COUNT";
+        case TokenKind::kSum: return "SUM";
+        case TokenKind::kAvg: return "AVG";
+        case TokenKind::kMin: return "MIN";
+        case TokenKind::kMax: return "MAX";
+        case TokenKind::kExplain: return "EXPLAIN";
     }
     return "unknown";
 }

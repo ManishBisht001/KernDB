@@ -38,6 +38,10 @@ Result<std::vector<std::byte>> EncodeRecord(const Schema& schema, const Tuple& t
             writer.WriteUInt64(std::bit_cast<std::uint64_t>(std::get<std::int64_t>(tuple[index])));
             continue;
         }
+        if (schema[index].type != ColumnType::kText) {
+            return Status::Error(ErrorCode::kUnsupported, "only INT and TEXT values can be stored in table records")
+                .WithContext("column", schema[index].name);
+        }
 
         const std::string& text = std::get<std::string>(tuple[index]);
         if (text.size() > kMaxInlineTextBytes) {
@@ -79,6 +83,10 @@ Result<Tuple> DecodeRecord(const Schema& schema, std::span<const std::byte> enco
             }
             tuple.emplace_back(std::bit_cast<std::int64_t>(integer.value()));
             continue;
+        }
+        if (column.type != ColumnType::kText) {
+            return RecordError("catalog schema contains a non-storable result type")
+                .WithContext("column", column.name);
         }
 
         const auto length = reader.ReadUInt32();

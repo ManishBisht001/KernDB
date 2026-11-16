@@ -73,3 +73,25 @@ KERNDB_TEST(ParserRejectsUnsupportedAndMultiStatementSyntax) {
     KERNDB_EXPECT(!kerndb::parser::ParseSql("BEGIN TRANSACTION").ok());
     KERNDB_EXPECT(!kerndb::parser::ParseSql("COMMIT AND CHAIN").ok());
 }
+
+KERNDB_TEST(ParserBuildsAdvancedSelectClausesAndExplain) {
+    const auto parsed = kerndb::parser::ParseSql(
+        "SELECT people.id, COUNT(*) FROM people LEFT JOIN visits "
+        "ON people.id = visits.person_id WHERE people.id >= 1 "
+        "GROUP BY people.id HAVING COUNT(*) > 0 "
+        "ORDER BY people.id DESC, visits.person_id ASC LIMIT 5");
+    KERNDB_EXPECT(parsed.ok());
+    const auto& select = std::get<kerndb::parser::AstSelect>(parsed.value());
+    KERNDB_EXPECT_EQ(std::size_t{2U}, select.projections.size());
+    KERNDB_EXPECT(select.join.has_value());
+    KERNDB_EXPECT_EQ(kerndb::parser::AstJoinKind::kLeft, select.join->kind);
+    KERNDB_EXPECT_EQ(kerndb::parser::ComparisonOperator::kGreaterEqual, select.predicate->comparison);
+    KERNDB_EXPECT_EQ(std::size_t{1U}, select.group_by.size());
+    KERNDB_EXPECT(select.having.has_value());
+    KERNDB_EXPECT_EQ(std::size_t{2U}, select.order_by.size());
+    KERNDB_EXPECT_EQ(std::int64_t{5}, select.limit.value());
+
+    const auto explain = kerndb::parser::ParseSql("EXPLAIN SELECT id FROM people ORDER BY id LIMIT 0");
+    KERNDB_EXPECT(explain.ok());
+    KERNDB_EXPECT(std::holds_alternative<kerndb::parser::AstExplainSelect>(explain.value()));
+}

@@ -545,6 +545,9 @@ crash-safe transactional durability. See `docs/CONCURRENCY_PHASE6.md`.
 
 ### Phase 7 — WAL and crash recovery
 
+**Status:** Intentionally postponed. No WAL or crash-recovery code is part of
+this repository's Phase 8 work.
+
 **Goal:** Recover a consistent state after every supported crash point.
 
 **Components:** log codecs; segmented log manager; durable LSN; WAL-before-page
@@ -565,24 +568,34 @@ at every supported injected crash point.
 
 ### Phase 8 — Query capability and operations
 
+**Status:** Implemented for the bounded SQL subset in
+`docs/ADVANCED_SQL_PHASE8.md`; storage NULLs, spill, hash joins, and statistics
+remain deferred.
+
 **Goal:** Improve SQL breadth, planning, and operability.
 
-**Components:** joins (nested loop then hash), sort/limit/aggregates, predicate
-normalization, statistics, cost-informed planner, EXPLAIN, memory-limited
-operators/spill, buffer writer/checkpointer, telemetry, benchmarks, maintenance.
+**Components:** one INNER or LEFT nested-loop join; qualified column binding;
+stable multi-column sort; LIMIT; COUNT/SUM/AVG/MIN/MAX; GROUP BY/HAVING;
+rule-based predicate pushdown and persistent equality-index selection; EXPLAIN.
+The planner does not use statistics or estimate costs. Projection pushdown is
+not available because storage scans return complete tuples. Hash joins,
+memory-limited operators, spill, background writers, and maintenance remain
+later work.
 
-**Dependencies:** Phases 6–7. Spilling/background work has transaction and
-shutdown semantics.
+**Dependencies:** Phases 1–6. This phase does not depend on or implement Phase 7
+WAL/recovery; it does not add MVCC. Any future spilling or background work must
+define transaction and shutdown semantics first.
 
-**Expected files/modules:** extended planner/executors/stats/observability,
-benchmarks, workload fixtures, and metrics documentation.
+**Expected files/modules:** parser, binder, logical/physical plans, query
+executor, SQL tests, and advanced SQL documentation.
 
-**Tests:** join/aggregate suites; plan golden cases; statistics bounds; memory
-limit/spill cleanup; benchmark smoke; event compatibility; background shutdown/
-checkpoint regression.
+**Tests:** ORDER BY/LIMIT; joins and NULL extension; aggregates, GROUP BY, and
+HAVING; empty input and invalid types; index selection; EXPLAIN; feature
+combinations; and Phase 0–6 regressions.
 
-**Working at end:** a small but coherent database has durable concurrent indexed
-storage, recovery, and telemetry ready for a separate web layer.
+**Working at end:** advanced SELECT queries work over in-memory and persistent
+tables using nested-loop joins, with rule-based planning and readable EXPLAIN
+output. Persistence remains orderly-close only because WAL is deferred.
 
 ### Phase 9 — Approved research tracks
 

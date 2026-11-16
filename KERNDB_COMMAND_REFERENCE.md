@@ -40,7 +40,14 @@ These forms are reconstructed from `src/parser/parser.cpp` and its AST in `src/p
 CREATE TABLE table_name (column_name INT|TEXT [, column_name INT|TEXT ...])
 CREATE INDEX index_name ON table_name (column_name)
 INSERT INTO table_name VALUES (literal [, literal ...])
-SELECT column_name [, column_name ...] FROM table_name [WHERE column_name = literal]
+SELECT select_item [, select_item ...] FROM table_name
+  [INNER JOIN table_name ON column_ref = column_ref | LEFT JOIN table_name ON column_ref = column_ref]
+  [WHERE column_ref comparison literal]
+  [GROUP BY column_ref [, column_ref ...]]
+  [HAVING aggregate(column_ref_or_*) comparison literal]
+  [ORDER BY column_ref [ASC|DESC] [, column_ref [ASC|DESC] ...]]
+  [LIMIT non_negative_integer]
+EXPLAIN SELECT ...
 UPDATE table_name SET column_name = literal WHERE column_name = literal
 DELETE FROM table_name WHERE column_name = literal
 BEGIN;
@@ -48,9 +55,9 @@ COMMIT;
 ROLLBACK;
 ```
 
-`literal` is a signed 64-bit integer or a single-quoted string. A single quote inside a string is written twice, for example `'Ada''s'`. `--` starts a line comment. The only SQL comparison operator is `=`. `CREATE TABLE` needs at least one column. `INSERT` needs one row's values in table-column order; it has no column-name list and takes one row per statement. `SELECT` must name at least one projection; `*` is not accepted. `WHERE` supports one column-to-literal equality predicate.
+`literal` is a signed 64-bit integer or a single-quoted string. A single quote inside a string is written twice, for example `'Ada''s'`. `--` starts a line comment. SELECT `WHERE` and `HAVING` support `=`, `!=`, `<`, `<=`, `>`, and `>=`; UPDATE and DELETE still use equality predicates. `CREATE TABLE` needs at least one column. `INSERT` takes one row's values in table-column order and has no column-name list. `SELECT` must name at least one projection; `*`, aliases, expressions, and multiple joins are not supported. KernDB accepts at most one join between two tables, and its ON condition must compare columns from both inputs with equality.
 
-KernDB's type system has `INT` (stored as signed 64-bit integer) and `TEXT`. A persistent inline `TEXT` value is limited to 1024 bytes. Binder checks that each literal type matches its target column or predicate column. No SQL `NULL` value or nullable-column syntax exists.
+Stored columns use `INT` (signed 64-bit) or `TEXT`; persistent inline `TEXT` is limited to 1024 bytes. `AVG` returns a `REAL` query result. KernDB does not store SQL NULL, but LEFT JOIN and empty SUM/AVG/MIN/MAX results can contain output-only NULL values. Binder checks literal and aggregate types.
 
 ### Supported statements and implementation trail
 
@@ -58,8 +65,13 @@ KernDB's type system has `INT` (stored as signed 64-bit integer) and `TEXT`. A p
 |---|---|---|---|
 | `CREATE TABLE` — **SUPPORTED** | `CREATE TABLE stu (id INT, name TEXT);` | Creates a table with one or more `INT`/`TEXT` columns. Duplicate column names are rejected. In the default `Database()` session it is in memory; with `--database` it creates a persistent table file and catalog entry. | Lexer `LexSql`; parser `ParseCreateTable`; AST `AstCreateTable`; binder `BindCreateTable`; catalog `InMemoryCatalog::CreateTable`; planner `BuildLogicalPlan` / `BuildPhysicalPlan`; executor `ExecuteCreateTable`; persistent storage `PersistentStorage::CreateTable`; heap pages through `PageManager`. Tests: `DatabaseExecutesTheApprovedPhaseOneVerticalSlice`, `PersistentDatabaseReopensTheApprovedVerticalSlice`. |
 | `INSERT INTO` — **SUPPORTED** | `INSERT INTO stu VALUES (1, 'Aman');` | Inserts one row. Values must match all table columns in schema order and have matching types. Returns an affected-row count of 1. A unique index rejects duplicate keys. | Parser `ParseInsert`; AST `AstInsert`; binder `BindInsert`; planner `BuildPhysicalPlan`; executor `ExecuteInsert`; persistent `PersistentStorage::Insert`; heap `TableHeap::Insert`; index maintenance `InsertIndexEntry`. Tests: `DatabaseExecutesTheApprovedPhaseOneVerticalSlice`, `PersistentDatabaseBuildsMaintainsAndReopensAnIntIndex`. |
-| `SELECT` — **PARTIAL** | `SELECT id, name FROM stu;` | Reads and projects named columns. Optional `WHERE` is only one equality predicate. `SELECT *`, expressions, aliases, joins, sorting, and grouping are not supported. | Parser `ParseSelect`; AST `AstSelect`; binder `BindSelect`; planner `BuildPhysicalPlan`; executor `ExecuteSequentialScan` or `ExecuteIndexScan`; heap `TableHeap::Scan`. Tests: `DatabaseExecutesTheApprovedPhaseOneVerticalSlice`, `ParserBuildsAllSupportedStatementKinds`. |
-| `WHERE` — **PARTIAL** | `SELECT id FROM stu WHERE id = 1;` | Filters using exactly `column = literal`. It can compare an `INT` column to an integer literal or a `TEXT` column to a string literal. One condition only; the literal type must match the column. | Parser `ParsePredicate`; AST `AstPredicate`; binder `BindPredicate`; executor `ExecuteSequentialScan` or `ExecuteIndexScan`. Tests: `DatabaseReportsTheRequiredPhaseOneErrors`, `PlannerLowersIntEqualityToAnIndexScanCandidate`, `PersistentDatabaseBuildsMaintainsAndReopensAnIntIndex`. |
+| `SELECT` — **PARTIAL** | `SELECT id, name FROM stu ORDER BY id DESC LIMIT 10;` | Reads named columns. Supports one equality join, WHERE comparisons, aggregates, GROUP BY/HAVING, ORDER BY, and LIMIT. `SELECT *`, aliases, expressions, and multiple joins are not supported. | Parser `ParseSelect`; AST `AstSelect`; binder `BindSelect`; planner logical/physical select plans; executor `ExecuteAdvancedSelect`, `ExecuteSequentialScan`, and `ExecuteIndexScan`. Tests: `ExecutorSortsStablyAndAppliesLimitAfterOrderBy`, `ExecutorRunsInnerAndLeftNestedLoopJoinsWithNullExtension`, `ExecutorComputesAggregatesGroupsHavingAndEmptyInputSemantics`. |
+| `WHERE` — **PARTIAL** | `SELECT id FROM stu WHERE id >= 1;` | One SELECT column-to-literal predicate using `=`, `!=`, `<`, `<=`, `>`, or `>=`. Literal and column types must match. UPDATE and DELETE remain equality-only. For joins, qualified references resolve against either input; ambiguous unqualified references fail binding. | Parser `AstSelectPredicate`; binder `BindSelectQuery`; executor `ExecuteAdvancedSelect`; matching persistent INT equality indexes use `ExecuteIndexScan` or indexed advanced scan. Tests: `DatabaseReportsTheRequiredPhaseOneErrors`, `BinderResolvesQualifiedJoinColumnsAndRejectsAmbiguity`, `PlannerUsesAnAvailablePersistentIntIndex`. |
+| `INNER JOIN`, `LEFT JOIN` — **PARTIAL** | `SELECT stu.name, visits.score FROM stu LEFT JOIN visits ON stu.id = visits.person_id;` | One equality join between two tables, executed as a nested-loop join. Qualified references are supported. LEFT JOIN appends output NULL values for unmatched right rows. Aliases and further joins are unsupported. | Parser `AstJoin`; binder `BoundJoin`; physical `Nested Loop Join`; executor `ExecuteAdvancedSelect`. Tests: `ExecutorRunsInnerAndLeftNestedLoopJoinsWithNullExtension`, `BinderResolvesQualifiedJoinColumnsAndRejectsAmbiguity`. |
+| Aggregates — **PARTIAL** | `SELECT COUNT(*), SUM(score), AVG(score), MIN(score), MAX(score) FROM visits;` | Supports COUNT(*), COUNT(column), SUM, AVG, MIN, MAX. SUM/AVG require INT; MIN/MAX accept INT or TEXT. Empty input returns one aggregate row: COUNT is zero and other aggregates are NULL. | Parser aggregate items; binder type checks; executor `ComputeAggregate`. Tests: `ExecutorComputesAggregatesGroupsHavingAndEmptyInputSemantics`. |
+| `GROUP BY`, `HAVING` — **PARTIAL** | `SELECT person_id, SUM(score) FROM visits GROUP BY person_id HAVING SUM(score) > 10;` | One or more grouping columns. Nonaggregate selected columns must be grouped. HAVING compares one aggregate result with one literal. | Parser `AstSelect::group_by` / `having`; binder grouping validation; executor grouping and aggregate stages. Tests: `BinderValidatesGroupingAggregateTypesAndLimit`, `ExecutorComputesAggregatesGroupsHavingAndEmptyInputSemantics`. |
+| `ORDER BY`, `LIMIT` — **PARTIAL** | `SELECT id FROM stu ORDER BY id ASC LIMIT 5;` | Stable multi-column ordering with ASC/DESC. LIMIT accepts nonnegative integer values including zero and runs after ordering. NULL result values sort last. | Parser `AstOrderBy` / `limit`; binder validation; executor stable sort and row limit. Tests: `ExecutorSortsStablyAndAppliesLimitAfterOrderBy`. |
+| `EXPLAIN SELECT` — **SUPPORTED** | `EXPLAIN SELECT id FROM stu WHERE id = 1;` | Returns readable logical and physical operator trees. The physical tree shows an index scan only when the persistent table has a matching INT equality index. | Parser `AstExplainSelect`; planner `LogicalExplainSelect` / `PhysicalExplainSelect`; executor `ExecuteExplain`. Tests: `DatabaseExplainsAdvancedOperatorsAndRejectsInvalidAdvancedSql`, `PersistentOptimizerExplainsAndUsesAnAvailableEqualityIndex`. |
 | `CREATE INDEX` — **PARTIAL** | `CREATE INDEX stu_id_idx ON stu(id);` | Creates a unique index on one `INT` column. There can be only one index per table column. Existing duplicate values make index creation fail. Persistent databases get a B+ tree; in-memory databases retain index metadata and enforce uniqueness but do not create B+ tree pages. | Parser `ParseCreateIndex`; AST `AstCreateIndex`; binder `BindCreateIndex` (rejects non-`INT`); catalog `InMemoryCatalog::CreateIndex`; executor `ExecuteCreateIndex`; persistent `PersistentStorage::CreateIndex`; B+ tree `BPlusTree::Create` / `Insert`. Tests: `BinderResolvesCreateIndexAndRestrictsItToIntColumns`, `PersistentDatabaseBuildsMaintainsAndReopensAnIntIndex`, `PersistentDatabaseIndexesExistingRowsAcrossSplitsAndRestart`, `ExecutorAcceptsCreateIndexForTheInMemoryFallback`. |
 | `UPDATE` — **PARTIAL** | `UPDATE stu SET name = 'Aman Verma' WHERE id = 1;` | Changes one assigned column for every row matching one equality predicate. Exactly one assignment is allowed, and `WHERE` is mandatory. Type checking applies. Persistent updates replace the heap record, refresh all index RIDs, and tombstone the old slot. | Parser `ParseUpdate`; AST `AstUpdate`; binder `BindUpdate`; planner `BuildPhysicalPlan`; executor `ExecuteUpdate`; persistent `PersistentStorage::UpdateMatching`; heap `TableHeap::Insert` / `Erase` / `Restore`; B+ tree `Remove` / `Insert`. Tests: `ParserBuildsAllSupportedStatementKinds`, `PersistentDatabaseUpdatesRowsAndMaintainsUniqueIndexes`, `PersistentDatabaseMutationChangesSurviveRestartWithMultipleIndexes`. |
 | `DELETE` — **PARTIAL** | `DELETE FROM stu WHERE id = 1;` | Deletes every row matching one equality predicate. `WHERE` is mandatory. Persistent deletion tombstones heap slots and removes entries from indexes; deleted slot space is not reclaimed. | Parser `ParseDelete`; AST `AstDelete`; binder `BindDelete`; planner `BuildPhysicalPlan`; executor `ExecuteDelete`; persistent `PersistentStorage::DeleteMatching`; heap `TableHeap::Erase`; B+ tree `Remove`. Tests: `ParserBuildsAllSupportedStatementKinds`, `PersistentDatabaseDeletesRowsMaintainsIndexesAndReusesKeys`. |
@@ -75,8 +87,8 @@ KernDB's type system has `INT` (stored as signed 64-bit integer) and `TEXT`. A p
 |---|---|---|
 | `CREATE TABLE` | **SUPPORTED** | One or more `INT`/`TEXT` columns. |
 | `INSERT INTO` | **SUPPORTED** | One tuple per statement, all values in table order; no named column list. |
-| `SELECT` | **PARTIAL** | Named columns from one table; no `*` or expressions. |
-| `WHERE` | **PARTIAL** | A single `column = literal` predicate. |
+| `SELECT` | **PARTIAL** | Named columns; one join maximum, no `*`, aliases, or general expressions. |
+| `WHERE` | **PARTIAL** | One column-to-literal predicate with standard comparison operators on SELECT. |
 | `CREATE INDEX` | **PARTIAL** | Unique B+ tree for one `INT` column in persistent mode. |
 | `UPDATE` | **PARTIAL** | One `SET column = literal`, mandatory single equality `WHERE`. |
 | `DELETE` | **PARTIAL** | Mandatory single equality `WHERE`. |
@@ -86,21 +98,21 @@ KernDB's type system has `INT` (stored as signed 64-bit integer) and `TEXT`. A p
 | `DROP INDEX` | **NOT SUPPORTED** | No drop statement in token, AST, or parser. |
 | `ALTER TABLE` | **NOT SUPPORTED** | No alter statement in token, AST, or parser. |
 | SQL `CREATE DATABASE` / `DROP DATABASE` | **NOT SUPPORTED** | Persistent directories are opened through the CLI `--database DIRECTORY` option or C++ `Database::Open`, not SQL. |
-| `JOIN` | **NOT SUPPORTED** | The AST and planner have one table reference per `SELECT`. |
-| `ORDER BY` | **NOT SUPPORTED** | No parser production or sort operator. |
-| `GROUP BY` | **NOT SUPPORTED** | No parser production or grouping operator. |
-| `LIMIT` | **NOT SUPPORTED** | No parser production or limit operator. |
+| `JOIN` | **PARTIAL** | One INNER or LEFT equality nested-loop join between two tables; no aliases or additional joins. |
+| `ORDER BY` | **PARTIAL** | Multiple column references, ASC/DESC; grouped queries can order by grouping columns. |
+| `GROUP BY` | **PARTIAL** | One or more columns; selected nonaggregate columns must be grouped. |
+| `LIMIT` | **SUPPORTED** | Nonnegative signed 64-bit integer, including zero; applied after sort/aggregation. |
 | `DISTINCT` | **NOT SUPPORTED** | No parser production or distinct operator. |
-| `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` | **NOT SUPPORTED** | These are not expression or aggregate functions in the grammar. |
+| `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` | **PARTIAL** | COUNT accepts `*` or a column; SUM/AVG accept INT; MIN/MAX accept INT or TEXT. |
 | `=` | **SUPPORTED** | Equality between one column and one type-matching literal. |
-| `!=`, `<>`, `<`, `>`, `<=`, `>=` | **NOT SUPPORTED** | Lexer/parser only define `=` as a comparison token. |
+| `!=`, `<`, `>`, `<=`, `>=` | **PARTIAL** | Supported for SELECT WHERE and HAVING; UPDATE/DELETE remain equality-only. `<>` is not tokenized. |
 | `AND`, `OR`, `NOT` | **NOT SUPPORTED** | No boolean-expression grammar or tokens. |
-| `NULL` handling | **NOT SUPPORTED** | No `NULL` literal, null bitmap, or nullable-column syntax. `NULL` cannot be used as an `INSERT`, `UPDATE`, or predicate literal. |
+| `NULL` handling | **PARTIAL** | No stored NULL, NULL literal, or nullable-column syntax. Query results use NULL for LEFT JOIN extension and empty SUM/AVG/MIN/MAX. |
 | Multiple conditions | **NOT SUPPORTED** | One predicate is stored in `AstSelect`, `AstUpdate`, and `AstDelete`. |
 | Multiple columns | **PARTIAL** | Supported in table definitions, insert value lists, and `SELECT` projection lists. `UPDATE` assignments and index definitions each allow one column. |
 | Multiple inserted rows in one statement | **NOT SUPPORTED** | One parenthesized value list is parsed per `INSERT`; issue another statement for another row. |
 
-Unsupported features are absent from the actual token/AST/parser/planner flow, not merely omitted from the examples. `ParserRejectsUnsupportedAndMultiStatementSyntax` demonstrates parser rejection with `SELECT *` and multiple statements in one SQL string. The suite does not have a separate negative test for every unsupported keyword in the checklist.
+Unsupported features listed here are absent from the implemented token/AST/parser/planner flow, not merely omitted from the examples. `ParserRejectsUnsupportedAndMultiStatementSyntax` demonstrates parser rejection with `SELECT *` and multiple statements in one SQL string.
 
 ## 3. Complete Working Example
 
@@ -174,13 +186,13 @@ An index is unique: each integer key maps to at most one RID. Duplicate inserts 
 
 ### Trace: `SELECT id, name FROM stu WHERE id = 1`
 
-1. `Database::Execute` calls `parser::ParseSql`; the lexer emits tokens and the parser builds `AstSelect` with two projection identifiers and an equality `AstPredicate`.
+1. `Database::Execute` calls `parser::ParseSql`; the lexer emits tokens and the parser builds `AstSelect` with two projection columns and an equality predicate.
 2. `binder::BindStatement` resolves `stu`, `id`, and `name` against the catalog, and checks that the `1` literal is an `INT` matching `id`.
-3. `planner::BuildPhysicalPlan` chooses a `PhysicalIndexScan` for an integer equality predicate. This is a rule-based candidate choice; the planner does not first check whether an index exists.
+3. The binder records whether the table has an index on the filtered integer column. For persistent storage, the rule-based planner chooses `PhysicalIndexScan` only when that index exists; otherwise it chooses a sequential scan.
 4. `execution::ExecuteIndexScan` asks `TableStorage::LookupByIndex` for the indexed column and key. Persistent storage finds a matching catalog index, opens its B+ tree, calls `BPlusTree::Search(1)`, then reads the row from the heap using the returned RID. The executor checks that the returned tuple still has key `1` and projects `id, name`.
 5. If there is no persistent index for that column, the storage interface reports `index_available == false` and the executor falls back to a sequential heap scan. For a default in-memory database, the index-scan executor also uses the sequential-scan path.
 
-The relevant tests are `PlannerLowersIntEqualityToAnIndexScanCandidate`, `PersistentDatabaseBuildsMaintainsAndReopensAnIntIndex`, and `PersistentDatabaseIndexesExistingRowsAcrossSplitsAndRestart`. SQL equality lookup is implemented; SQL range lookups are **NOT SUPPORTED**.
+The relevant tests are `PlannerUsesAnAvailablePersistentIntIndex`, `PersistentDatabaseBuildsMaintainsAndReopensAnIntIndex`, and `PersistentDatabaseIndexesExistingRowsAcrossSplitsAndRestart`. SELECT comparison predicates are implemented, but range predicates currently use sequential scans; SQL range index scans are **NOT SUPPORTED**.
 
 ## 5. Phase-by-Phase Architecture
 
@@ -192,9 +204,11 @@ The phase names come from `IMPLEMENTATION_PLAN.md` and the phase-specific docume
 | 1 — SQL frontend and in-memory execution | Native lexer and recursive-descent parser, AST, `INT`/`TEXT` values, catalog, binder, logical/physical plans, in-memory create/insert/select/filter/projection, plus later mutation statements. | **Implemented initial SQL slice**, with the precise command limits in Section 2. See `src/parser`, `src/binder`, `src/catalog`, `src/planner`, `src/execution`, and `DatabaseExecutesTheApprovedPhaseOneVerticalSlice`. |
 | 2 — Durable paged heap | Database metadata, fixed-size checksum-protected pages, disk/page managers, slotted-page heap records, persisted table catalog, and reopen. | **Implemented for orderly clean reopen.** See `src/storage/{database_metadata,disk_manager,page,page_manager,heap,catalog_store,record,persistent_storage}.cpp` and `PersistentDatabaseRetainsMultipleRowsAndPhaseOneSemanticsAfterRestart`. No crash-safe durability. |
 | 3 — Buffer pool | Bounded cache (16 frames by default), pin guards, dirty-page writes, LRU selection among unpinned pages, flush and telemetry paths. | **Implemented.** See `src/storage/buffer_pool.cpp` and `tests/unit/storage/buffer_pool_test.cpp`, including `BufferPoolEvictsTheLeastRecentlyUnpinnedFrame` and `BufferPoolPersistsDirtyPagesAcrossAnOrderlyRestart`. |
-| 4 — B+ tree and simple planning | Persistent unique `INT` indexes, index catalog, leaf/internal pages, equality lookup, leaf/internal splits, root metadata updates, and sequential fallback. | **Implemented for equality lookup.** There is no SQL range scan, cost-based optimizer, statistics-driven plan selection, or `EXPLAIN`. See `src/storage/bplus_tree.cpp`, `src/storage/index_catalog_store.cpp`, `src/planner/planner.cpp`, and the B+ tree/integration tests. |
+| 4 — B+ tree and simple planning | Persistent unique `INT` indexes, index catalog, leaf/internal pages, equality lookup, leaf/internal splits, root metadata updates, and sequential fallback. | **Implemented for equality lookup.** There is no range index scan or statistics-driven plan selection. Phase 8 adds EXPLAIN and rule-based planning. See `src/storage/bplus_tree.cpp`, `src/storage/index_catalog_store.cpp`, `src/planner/planner.cpp`, and the B+ tree/integration tests. |
 | 5 — Mutation / transactions | Persistent and in-memory `INSERT`, `UPDATE`, and `DELETE`; statement compensation; explicit `BEGIN`/`COMMIT`/`ROLLBACK`; persistent reverse-action history and in-memory catalog snapshots; transaction-local read visibility; DDL rejection; close-time rollback. | **IMPLEMENTED.** Evidence includes `PersistentStorageRollsBackAnUpdateAfterHeapAndIndexChanges`, `PersistentDatabaseCommitsExplicitInsertAndPersistsIt`, `PersistentDatabaseRollsBackExplicitInsertAcrossReopen`, `PersistentDatabaseRollsBackMultipleMutationsInReverseAndRestoresIndexedRid`, `PersistentDatabaseKeepsFailedStatementAtomicAndTransactionActive`, `PersistentDatabaseCloseRollsBackActiveTransaction`, and `InMemoryDatabaseSupportsExplicitTransactionRollback`. See `docs/MUTATIONS_PHASE5.md`, `src/database.cpp`, `src/storage/persistent_storage.cpp`, and the Phase 5 integration tests. Phase 6 supplies concurrency control; WAL, crash recovery, and crash-safe durability remain unsupported. |
 | 6 — Concurrency and strict 2PL | Same-process persistent sessions; independent transaction IDs and lifecycle; catalog/table S/X locks retained to completion; deadlock detection and victim rollback; synchronized persistent storage, buffer pool, and B+ tree access. | **IMPLEMENTED for the documented process-local, table-lock scope.** Evidence includes the `PersistentSessions...` integration tests, four `LockManager...` unit tests, `TransactionManagerCreatesUniqueContextsAndTracksTerminalStates`, `BufferPoolSerializesConcurrentPageGuardAccess`, and `BPlusTreeSupportsConcurrentInsertionsAndLookups`. See `docs/CONCURRENCY_PHASE6.md`, `src/concurrency/lock_manager.cpp`, `src/transaction/transaction_manager.cpp`, and `src/database.cpp`. Cross-process coordination, row locks, MVCC, WAL, and crash recovery are unsupported. |
+| 7 — WAL and crash recovery | Write-ahead log, durable LSN, redo/undo, checkpoints, startup recovery, and crash-point testing. | **POSTPONED.** No WAL or crash-recovery components are implemented. |
+| 8 — Advanced SQL and query planning | ORDER BY, LIMIT, one INNER/LEFT nested-loop join, aggregates, GROUP BY/HAVING, qualified columns, predicate filtering, persistent equality-index selection, and EXPLAIN. | **IMPLEMENTED for the bounded syntax in `docs/ADVANCED_SQL_PHASE8.md`.** Planning is rule based without statistics or cost estimates. Stored NULLs, projection pushdown, hash joins, spill, and performance claims are deferred. WAL/recovery remains postponed. |
 
 There is no separate B+ tree source module directory: the implementation is currently under `src/storage`. Also, `docs/DEVELOPMENT.md` and some Phase 1/2 notes describe earlier snapshots of the engine; later Phase 3/4/5 code and the current parser/tests establish the broader implementation described here.
 
@@ -221,7 +235,8 @@ CLI or C++ caller
 |---|---|---|---|---|
 | Create table | `CREATE TABLE t (c INT|TEXT [, ...])` | SUPPORTED | Define a table and its columns. | Parser, binder, catalog, executor, persistent storage |
 | Insert row | `INSERT INTO t VALUES (literal [, ...])` | SUPPORTED | Add one schema-ordered row. | Binder, executor, heap |
-| Select | `SELECT c [, ...] FROM t [WHERE c = literal]` | PARTIAL | Project columns, optionally filter one equality. | Planner, executor, heap or B+ tree |
+| Select | `SELECT c [, ...] FROM t [JOIN ...] [WHERE ...] [GROUP BY ...] [ORDER BY ...] [LIMIT n]` | PARTIAL | Project, filter, join, group, sort, and limit rows. | Planner, executor, heap or B+ tree |
+| Explain | `EXPLAIN SELECT ...` | SUPPORTED | Display the logical and physical query plan. | Planner, executor |
 | Create index | `CREATE INDEX i ON t (c)` | PARTIAL | Create a unique `INT` equality index. | Binder, executor, B+ tree, buffer pool |
 | Update | `UPDATE t SET c = literal WHERE c = literal` | PARTIAL | Change one column in matching rows. | Binder, executor, heap, index maintenance |
 | Delete | `DELETE FROM t WHERE c = literal` | PARTIAL | Remove matching rows. | Binder, executor, heap, index maintenance |
@@ -229,7 +244,7 @@ CLI or C++ caller
 | Commit transaction | `COMMIT;` | SUPPORTED | Discard undo history and end the active transaction. | `Database`, `PersistentStorage` |
 | Roll back transaction | `ROLLBACK;` | SUPPORTED | Apply retained undo actions or restore the in-memory catalog snapshot. | `Database`, storage backend |
 | Drop / alter | `DROP ...` / `ALTER TABLE ...` | NOT SUPPORTED | No grammar or executor exists. | — |
-| Join / aggregate / order / group / limit | SQL clauses or functions | NOT SUPPORTED | No grammar or physical operators exist. | — |
+| Additional SQL limitations | aliases, multiple joins, DISTINCT, compound predicates | NOT SUPPORTED | These grammar and executor features are not implemented. | — |
 | Transactional DDL | `CREATE TABLE` / `CREATE INDEX` inside a transaction | NOT SUPPORTED | These statements return an error while an explicit transaction is active. | `Database::Execute` |
 
 ### Likely PBL viva questions
@@ -240,7 +255,7 @@ CLI or C++ caller
 4. **What does the lexer do?** — It recognizes keywords, identifiers, integer/string literals, punctuation, whitespace, and `--` comments, and records source locations.
 5. **What does the parser produce?** — One AST statement variant: create table/index, insert, select, update, delete, begin, commit, or rollback.
 6. **What does the binder check?** — It resolves table and column names and verifies literal/column types, insert arity, duplicate column names, and the `INT`-only index restriction.
-7. **Which data types exist?** — `INT` (signed 64-bit) and `TEXT`.
+7. **Which data types exist?** — Stored columns use `INT` (signed 64-bit) and `TEXT`; `AVG` returns `REAL`, and joins/empty aggregates can return output-only `NULL` values.
 8. **Can SQL commands be combined in one SQL string?** — No. `ParseSql` accepts one statement and at most one trailing semicolon. The CLI can take multiple repeated `--execute` options.
 9. **What is a RID?** — A record identifier made of a heap page ID and a slot ID; the B+ tree maps keys to these RIDs.
 10. **What is a heap table?** — Rows are stored in slotted pages; a slot records where the encoded row lives on a page.
@@ -250,8 +265,8 @@ CLI or C++ caller
 14. **Are index keys unique?** — Yes. An indexed `INT` key can identify at most one row; duplicate keys are rejected.
 15. **What happens when a B+ tree node fills up?** — It splits, a separator moves into the parent, and a root split creates a new root page.
 16. **How does an equality index lookup reach the row?** — It descends the internal nodes, searches a leaf, gets a RID, then reads that heap slot.
-17. **Does every integer `WHERE` use an index?** — The planner creates an index-scan candidate for integer equality. Persistent execution uses a matching index if available and otherwise falls back to a heap scan; in-memory mode scans.
-18. **Does KernDB support range queries using the B+ tree?** — The tree has an internal `ScanAll` helper, but SQL range predicates and range index scans are **NOT SUPPORTED**.
+17. **Does every integer `WHERE` use an index?** — Persistent planning chooses a matching index for `INT` equality only when that index exists; otherwise it uses a sequential scan. In-memory mode scans.
+18. **Does KernDB support range queries using the B+ tree?** — SELECT accepts range comparisons but executes them with a sequential scan. SQL range index scans are **NOT SUPPORTED**.
 19. **Where is persistent data stored?** — In the selected database directory, mainly `catalog.dat`, `tables/<id>.dat`, `indexes/catalog.dat`, and `indexes/<id>.dat`.
 20. **Does data survive restarting the program?** — Persistent committed changes and completed rollbacks survive an orderly close and reopen with `--database DIRECTORY`. Closing with a transaction active rolls it back. The default REPL is in memory and loses data at exit.
 21. **Is persistence crash-safe?** — No. There is no WAL or recovery code, and writes may reach disk before `COMMIT`; no crash-safe transactional durability is promised.
@@ -265,7 +280,7 @@ CLI or C++ caller
 29. **How does Phase 6 coordinate concurrent sessions?** — Catalog and table S/X locks are retained until commit or abort. Reads use S, writes use X, and deadlock detection aborts the requesting transaction that closes a cycle.
 30. **What does Phase 6 not provide?** — It does not coordinate separate processes, provide row-level locks or MVCC, or implement WAL, crash recovery, or crash-safe transactional durability.
 31. **Does Phase 5/6 make persistence crash-safe?** — No. Commit and rollback persist across clean close/reopen, but there is no WAL or recovery code and writes may reach disk before commit.
-32. **Which common SQL features are still missing?** — Joins, `ORDER BY`, `GROUP BY`, `LIMIT`, `DISTINCT`, aggregates, `NULL`, non-equality comparisons, and compound boolean conditions are **NOT SUPPORTED**.
+32. **Which common SQL features are still missing?** — Aliases, additional joins, `DISTINCT`, stored NULLs, expressions, subqueries, compound boolean conditions, range index scans, and cost-based planning are **NOT SUPPORTED**.
 
 ## 7. Limitations
 
@@ -278,11 +293,12 @@ CLI or C++ caller
 - **Rollback storage errors:** if transaction-level or deadlock-victim undo encounters a storage error, KernDB reports it but currently retires the transaction and releases its locks; full restoration is not guaranteed. This error path has no failure-injection test.
 - **Clean-shutdown persistence:** committed state and completed rollback state survive an orderly close and reopen.
 - **Crash recovery and durability:** there is no WAL, recovery, or crash-safe transactional durability. A crash during an active transaction can leave uncommitted or partial state because page writes can reach disk before commit.
-- Existing SQL limits still apply: one-row `INSERT`, one-column assignment per `UPDATE`, equality predicates only, unique `INT` indexes, and no joins, expressions, aggregates, range predicates, or `NULL`.
+- Existing SQL limits still apply: one-row `INSERT`, one-column assignment per `UPDATE`, equality-only UPDATE/DELETE predicates, unique `INT` indexes, one two-table join, one WHERE and one HAVING predicate, no aliases/expressions/subqueries/compound predicates, and no stored NULL.
+- The Phase 8 optimizer is rule based. It pushes a single filter to its scan input and selects an existing persistent INT equality index; it has no statistics or cost estimates. Projection pushdown is not available through the current full-tuple storage scan API. No Phase 8 performance improvement has been measured.
 
 ## 8. Verification
 
-This reference reflects the current source, Phase 5 and Phase 6 documentation, and the full test output recorded below.
+This reference reflects the current source, Phase 5, Phase 6, and Phase 8 documentation, and the verification run recorded below.
 
 Commands run from the project root:
 
@@ -296,7 +312,7 @@ Result: configure and generate succeeded; build files were written to `build/deb
 cmake --build --preset debug
 ```
 
-Result: succeeded; rebuilt `persistent_storage.cpp`, linked `libkerndb.a`, `kerndb_shell.exe`, and `kerndb_phase2_tests.exe`.
+Result: succeeded; rebuilt the SQL front end, binder, planner, executor, `libkerndb.a`, `kerndb_shell.exe`, and `kerndb_phase2_tests.exe`.
 
 ```text
 ctest --preset debug
@@ -308,7 +324,11 @@ Result: **3/3 CTest tests passed**: `kerndb.phase2.unit_and_integration`, `kernd
 .\build\debug\tests\kerndb_phase2_tests.exe
 ```
 
-Result: **89/89 unified unit and integration tests passed** on the first direct run. The direct executable was then run twice more; both repeats also passed **89/89**. This includes the Phase 5 transaction regressions, Phase 6 concurrency tests, and shell smoke tests.
+Result: **97/97 unified unit and integration tests passed.** This includes the Phase 0–6 regression cases, advanced SQL unit/integration coverage, and CLI shell smoke tests.
+
+The CLI `--help` and `--version` commands passed. An in-memory CLI run of `EXPLAIN SELECT ... GROUP BY ... HAVING ... ORDER BY ... LIMIT ...` displayed both logical and physical trees with Sequential Scan, Aggregate, Filter, Sort, Limit, and Projection operators. Persistent index-plan selection is covered by `PersistentOptimizerExplainsAndUsesAnAvailableEqualityIndex`.
+
+No performance benchmark was run, so no performance improvement is claimed.
 
 ThreadSanitizer availability probe:
 
@@ -325,9 +345,9 @@ Result: unavailable with the configured MSYS2 UCRT64 GCC. The linker reported `c
 | Area | Main files | Useful tests |
 |---|---|---|
 | CLI | `apps/kerndb_shell/main.cpp`, `apps/kerndb_shell/shell.cpp` | `ShellHelpAndVersionAreAvailableWithoutDatabaseAccess`, `ShellExecutesMultipleStatementsAgainstOneInMemoryDatabase`, `ShellUsesPersistentDatabaseDirectoryAcrossRuns` |
-| Lexer/parser/AST | `src/parser/lexer.cpp`, `src/parser/parser.cpp`, `src/parser/ast.h` | `LexerHandlesKeywordsCommentsEscapedStringsAndSpans`, `ParserBuildsAllSupportedStatementKinds`, `ParserRejectsUnsupportedAndMultiStatementSyntax` |
-| Binder/catalog/planner | `src/binder/binder.cpp`, `src/catalog/catalog.cpp`, `src/planner/planner.cpp` | `BinderResolvesCreateIndexAndRestrictsItToIntColumns`, `PlannerLowersIntEqualityToAnIndexScanCandidate` |
-| Executor | `src/execution/executor.cpp`, `src/database.cpp` | `ExecutorCreatesInsertsFiltersAndProjectsInMemoryRows`, `DatabaseExecutesTheApprovedPhaseOneVerticalSlice` |
+| Lexer/parser/AST | `src/parser/lexer.cpp`, `src/parser/parser.cpp`, `src/parser/ast.h` | `LexerHandlesKeywordsCommentsEscapedStringsAndSpans`, `ParserBuildsAllSupportedStatementKinds`, `ParserBuildsAdvancedSelectClausesAndExplain` |
+| Binder/catalog/planner | `src/binder/binder.cpp`, `src/catalog/catalog.cpp`, `src/planner/planner.cpp` | `BinderResolvesQualifiedJoinColumnsAndRejectsAmbiguity`, `BinderValidatesGroupingAggregateTypesAndLimit`, `PlannerUsesAnAvailablePersistentIntIndex` |
+| Executor | `src/execution/executor.cpp`, `src/database.cpp` | `ExecutorSortsStablyAndAppliesLimitAfterOrderBy`, `ExecutorRunsInnerAndLeftNestedLoopJoinsWithNullExtension`, `ExecutorComputesAggregatesGroupsHavingAndEmptyInputSemantics`, `DatabaseExplainsAdvancedOperatorsAndRejectsInvalidAdvancedSql` |
 | Heap and records | `src/storage/heap.cpp`, `src/storage/record.cpp` | `TableHeapPersistsAndScansTuplesThroughTheBufferPool`, `TableHeapTombstonesDeletedRecordsAndCanRestoreThemForRollback` |
 | Buffer pool and pages | `src/storage/buffer_pool.cpp`, `src/storage/page_manager.cpp`, `src/storage/page.cpp`, `src/storage/disk_manager.cpp` | `BufferPoolEvictsTheLeastRecentlyUnpinnedFrame`, `BufferPoolPersistsDirtyPagesAcrossAnOrderlyRestart` |
 | B+ tree/index catalog | `src/storage/bplus_tree.cpp`, `src/storage/index_catalog_store.cpp`, `src/storage/persistent_storage.cpp` | `BPlusTreeMaintainsSortedEntriesAcrossLeafAndInternalSplits`, `BPlusTreePersistsRootLeavesAndEntriesAcrossReopen`, `PersistentDatabaseIndexesExistingRowsAcrossSplitsAndRestart` |
